@@ -1,4 +1,4 @@
-name: Test Quark Upload And Share (Browser Profile)
+name: Test Quark Upload And Share (Fixed Alist + Native Share)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: 夸克原生直传与生成分享链接测试 (带真实浏览器指纹)
+      - name: 1. 启动并配置 AList 临时容器
         env:
           QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
         run: |
@@ -17,134 +17,164 @@ jobs:
           fi
 
           CLEAN_COOKIE=$(echo "$QUARK_COOKIE" | sed -e 's/^Cookie:[[:space:]]*//i' | tr -d '\r\n')
+          echo "CLEAN_COOKIE=$CLEAN_COOKIE" >> $GITHUB_ENV
 
-          # 封装通用浏览器请求函数
-          call_quark() {
-            local method="$1"
-            local url="$2"
-            local data="$3"
+          # 启动 AList 容器
+          docker run -d --name alist_worker -p 5244:5244 xhofe/alist:latest > /dev/null
+          until curl -s http://127.0.0.1:5244/api/public/settings > /dev/null; do sleep 1; done
 
-            local cmd=(curl -s -X "$method" "$url"
-              -b "$CLEAN_COOKIE"
-              -H 'accept: application/json, text/plain, */*'
-              -H 'accept-language: zh-CN,zh;q=0.9'
-              -H 'origin: https://pan.quark.cn'
-              -H 'priority: u=1, i'
-              -H 'referer: https://pan.quark.cn/'
-              -H 'sec-ch-ua: "Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"'
-              -H 'sec-ch-ua-mobile: ?0'
-              -H 'sec-ch-ua-platform: "Windows"'
-              -H 'sec-fetch-dest: empty'
-              -H 'sec-fetch-mode: cors'
-              -H 'sec-fetch-site: same-site'
-              -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
-            )
-
-            if [ -n "$data" ]; then
-              cmd+=(-H 'content-type: application/json;charset=UTF-8' -d "$data")
-            fi
-
-            "${cmd[@]}"
-          }
-
-          # 1. 查询根目录获取 docker_images FID
-          echo "🔍 1. 获取网盘根目录列表..."
-          ROOT_JSON=$(call_quark GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100")
-          TARGET_DIR_FID=$(echo "$ROOT_JSON" | jq -r '.data.list[] | select(.file_name=="docker_images") | .fid' 2>/dev/null || echo "")
-
-          if [ -z "$TARGET_DIR_FID" ]; then
-            echo "📁 未检测到 docker_images 目录，正在创建..."
-            MKDIR_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/file?pr=ucpro&fr=pc" '{"pdir_fid":"0","file_name":"docker_images","dir_init_lock":false}')
-            TARGET_DIR_FID=$(echo "$MKDIR_RES" | jq -r '.data.fid // empty')
-          fi
-          echo "✅ 目标保存目录 docker_images FID: $TARGET_DIR_FID"
-
-          # 2. 生成本地测试文件并计算属性
-          TEST_FILENAME="test_file_$(date +%s).tar"
-          LOCAL_PATH="/tmp/${TEST_FILENAME}"
-          echo "Hello Quark Direct Upload" > "$LOCAL_PATH"
-          FILE_SIZE=$(stat -c%s "$LOCAL_PATH")
-          FILE_MD5=$(md5sum "$LOCAL_PATH" | awk '{print $1}')
+          # 设置管理员密码并登录获取绝对有效的 Token
+          docker exec alist_worker ./alist admin set 123456 > /dev/null
           
-          echo "📦 测试文件: $TEST_FILENAME (大小: ${FILE_SIZE} 字节, MD5: $FILE_MD5)"
-
-          # 3. 申请原生直传通道
-          echo "📤 2. 申请夸克直传通道..."
-          PRE_PAYLOAD=$(jq -n \
-            --arg pdir "$TARGET_DIR_FID" \
-            --arg name "$TEST_FILENAME" \
-            --argjson size "$FILE_SIZE" \
-            --arg md5 "$FILE_MD5" \
-            '{
-              pdir_fid: $pdir,
-              file_name: $name,
-              size: $size,
-              md5: $md5,
-              format_type: "other",
-              ccp_hash_update: true
-            }')
-
-          PRE_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/file/upload/pre?pr=ucpro&fr=pc" "$PRE_PAYLOAD")
-          echo "通道响应: $PRE_RES"
-
-          UPLOAD_TASK_ID=$(echo "$PRE_RES" | jq -r '.data.task_id // empty')
-          UPLOAD_URL=$(echo "$PRE_RES" | jq -r '.data.upload_url // empty')
-          UPLOAD_FID=$(echo "$PRE_RES" | jq -r '.data.fid // empty')
-
-          # 4. 执行数据推流
-          if [ -n "$UPLOAD_URL" ] && [ "$UPLOAD_URL" != "null" ]; then
-            echo "⬆️ 正在推流上传文件数据..."
-            curl -s -X PUT "$UPLOAD_URL" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary @"$LOCAL_PATH" > /dev/null
-
-            echo "📥 确认提交上传任务..."
-            FINISH_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/file/upload/finish?pr=ucpro&fr=pc" "{\"task_id\":\"$UPLOAD_TASK_ID\"}")
-            UPLOAD_FID=$(echo "$FINISH_RES" | jq -r '.data.fid // empty')
-          fi
-
-          # 5. 确保拿到文件 FID
-          if [ -z "$UPLOAD_FID" ]; then
-            sleep 2
-            CHECK_RES=$(call_quark GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${TARGET_DIR_FID}&_size=100")
-            UPLOAD_FID=$(echo "$CHECK_RES" | jq -r --arg fn "$TEST_FILENAME" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
-          fi
-
-          if [ -z "$UPLOAD_FID" ]; then
-            echo "❌ 文件未成功存入网盘"
+          LOGIN_RES=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"username": "admin", "password": "123456"}')
+          
+          ALIST_TOKEN=$(echo "$LOGIN_RES" | jq -r '.data.token // empty')
+          if [ -z "$ALIST_TOKEN" ]; then
+            echo "❌ 获取 AList Token 失败: $LOGIN_RES"
             exit 1
           fi
-          echo "🎉 文件就绪！目标文件 FID: $UPLOAD_FID"
+          echo "ALIST_TOKEN=$ALIST_TOKEN" >> $GITHUB_ENV
+          echo "✅ AList 鉴权凭据就绪"
 
-          # 6. 生成 7 天分享直链 (url_type: 0, expired_type: 3)
-          echo "==================== 请求创建分享链接 ===================="
-          SHARE_PAYLOAD=$(jq -n --arg fid "$UPLOAD_FID" --arg title "$TEST_FILENAME" '{"fid_list":[$fid],"title":$title,"url_type":0,"expired_type":3}')
+          # 挂载夸克网盘存储驱动
+          STORAGE_PAYLOAD=$(jq -n \
+            --arg cookie "$CLEAN_COOKIE" \
+            '{
+              "mount_path": "/quark",
+              "order": 0,
+              "remark": "temp_driver",
+              "driver": "Quark",
+              "addition": "{\"cookie\":\"" + $cookie + "\",\"root_folder_id\":\"0\"}"
+            }')
+
+          MOUNT_RES=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
+            -H "Authorization: $ALIST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$STORAGE_PAYLOAD")
+
+          echo "挂载驱动响应: $MOUNT_RES"
+
+          # 验证挂载是否连通夸克
+          sleep 2
+          CHECK_MOUNT=$(curl -s -X POST http://127.0.0.1:5244/api/fs/list \
+            -H "Authorization: $ALIST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"path": "/quark"}')
           
-          STEP1_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" "$SHARE_PAYLOAD")
-          echo "📦 [原始数据] 第 1 步创建返回:"
-          echo "$STEP1_RES" | jq . || echo "$STEP1_RES"
+          if echo "$CHECK_MOUNT" | grep -q '"code":200'; then
+            echo "🎉 夸克网盘挂载成功！"
+          else
+            echo "❌ 挂载校验未通过，原始信息: $CHECK_MOUNT"
+            exit 1
+          fi
+
+      - name: 2. 模拟上传测试镜像包
+        run: |
+          TEST_DIR="test_demo"
+          TEST_FILE="test_image_$(date +%s)_amd64.tar"
+          LOCAL_TAR="/tmp/${TEST_FILE}"
+
+          # 生成 1MB 的测试归档文件
+          dd if=/dev/zero of="$LOCAL_TAR" bs=1M count=1 2>/dev/null
+          echo "TEST_DIR=$TEST_DIR" >> $GITHUB_ENV
+          echo "TEST_FILE=$TEST_FILE" >> $GITHUB_ENV
+
+          echo "📁 创建目标文件夹: /quark/docker_images/${TEST_DIR}..."
+          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
+            -H "Authorization: $ALIST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"path\": \"/quark/docker_images/${TEST_DIR}\"}" > /dev/null
+
+          echo "📤 开始流式直传测试文件 (带完整 Admin 鉴权)..."
+          UPLOAD_RES=$(curl -s -X PUT \
+            -H "Authorization: $ALIST_TOKEN" \
+            -H "File-Path: /quark/docker_images/${TEST_DIR}/${TEST_FILE}" \
+            -H "As-Task: false" \
+            -T "$LOCAL_TAR" \
+            "http://127.0.0.1:5244/api/fs/put")
+
+          echo "上传返回结果: $UPLOAD_RES"
+          rm -f "$LOCAL_TAR"
+
+          if ! echo "$UPLOAD_RES" | grep -q '"code":200'; then
+            echo "❌ 上传失败，终止流程"
+            exit 1
+          fi
+          echo "✅ 测试文件成功落盘至夸克网盘！"
+
+      - name: 3. 穿透夸克官方 API 生成 7 天直链
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+          
+          call_quark_get() {
+            curl -s -X GET "$1" \
+              -b "$CLEAN_COOKIE" \
+              -H "User-Agent: $UA" \
+              -H "Referer: https://pan.quark.cn/" \
+              -H "Origin: https://pan.quark.cn"
+          }
+
+          call_quark_post() {
+            curl -s -X POST "$1" \
+              -b "$CLEAN_COOKIE" \
+              -H "User-Agent: $UA" \
+              -H "Referer: https://pan.quark.cn/" \
+              -H "Origin: https://pan.quark.cn" \
+              -H "Content-Type: application/json;charset=UTF-8" \
+              -d "$2"
+          }
+
+          echo "🔍 1. 查找根目录 docker_images FID..."
+          ROOT_JSON=$(call_quark_get "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100")
+          ROOT_FID=$(echo "$ROOT_JSON" | jq -r '.data.list[] | select(.file_name=="docker_images") | .fid' 2>/dev/null || echo "")
+          echo "docker_images FID: $ROOT_FID"
+
+          echo "🔍 2. 查找分类子目录 ${TEST_DIR} FID..."
+          CAT_JSON=$(call_quark_get "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${ROOT_FID}&_size=100")
+          CAT_FID=$(echo "$CAT_JSON" | jq -r --arg dir "$TEST_DIR" '.data.list[] | select(.file_name==$dir) | .fid' 2>/dev/null || echo "")
+          echo "${TEST_DIR} 目录 FID: $CAT_FID"
+
+          echo "🔍 3. 查找测试文件 ${TEST_FILE} FID..."
+          FILE_JSON=$(call_quark_get "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${CAT_FID}&_size=100")
+          TARGET_FID=$(echo "$FILE_JSON" | jq -r --arg fn "$TEST_FILE" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
+          echo "文件 FID: $TARGET_FID"
+
+          if [ -z "$TARGET_FID" ]; then
+            echo "❌ 未能获取到落盘文件的 FID"
+            exit 1
+          fi
+
+          echo "==================== 请求创建官方分享链接 ===================="
+          # 核心验证参数：url_type=0 (公开免密直达), expired_type=3 (7天有效期)
+          SHARE_PAYLOAD=$(jq -n --arg fid "$TARGET_FID" --arg title "$TEST_FILE" '{"fid_list":[$fid],"title":$title,"url_type":0,"expired_type":3}')
+          
+          STEP1_RES=$(call_quark_post "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" "$SHARE_PAYLOAD")
+          echo "第 1 步创建响应: $STEP1_RES"
 
           SHARE_ID=$(echo "$STEP1_RES" | jq -r '.data.task_resp.data.share_id // .data.share_id // empty' 2>/dev/null || echo "")
           SHARE_URL=$(echo "$STEP1_RES" | jq -r '.data.task_resp.data.share_url // .data.share_url // empty' 2>/dev/null || echo "")
-          PASSCODE=""
+          PASSCODE="无"
 
-          if [ -n "$SHARE_ID" ] && [ -z "$SHARE_URL" ]; then
-            echo "🔄 [步骤换取] share_url 为空，调用 /share/password 获取..."
-            STEP2_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc" "{\"share_id\":\"$SHARE_ID\"}")
-            echo "🔑 [原始数据] 第 2 步换取返回:"
-            echo "$STEP2_RES" | jq . || echo "$STEP2_RES"
-
-            SHARE_URL=$(echo "$STEP2_RES" | jq -r '.data.share_url // .data.url // empty' 2>/dev/null || echo "")
-            PASSCODE=$(echo "$STEP2_RES" | jq -r '.data.passcode // .data.pwd // "无"' 2>/dev/null || echo "无")
+          if [ -n "$SHARE_ID" ]; then
+            STEP2_RES=$(call_quark_post "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc" "{\"share_id\":\"$SHARE_ID\"}")
+            echo "第 2 步换取响应: $STEP2_RES"
+            
+            URL_FROM_P2=$(echo "$STEP2_RES" | jq -r '.data.share_url // .data.url // empty' 2>/dev/null || echo "")
+            if [ -n "$URL_FROM_P2" ]; then SHARE_URL="$URL_FROM_P2"; fi
+            
+            FETCH_PASS=$(echo "$STEP2_RES" | jq -r '.data.passcode // .data.pwd // empty' 2>/dev/null || echo "")
+            if [ -n "$FETCH_PASS" ]; then PASSCODE="$FETCH_PASS"; fi
           fi
 
           echo "=========================================================="
           if [ -n "$SHARE_URL" ]; then
-            echo "🎉 全链路测试成功！"
-            echo "🔗 夸克分享直链: $SHARE_URL"
-            echo "🔑 密码/提取码: ${PASSCODE:-无}"
+            echo "🎉 全链路测试彻底打通！"
+            echo "🔗 夸克官方分享链接: $SHARE_URL"
+            echo "🔑 提取码: $PASSCODE"
           else
-            echo "❌ 生成分享链接失败"
+            echo "❌ 未能生成分享链接"
             exit 1
           fi
           echo "=========================================================="
