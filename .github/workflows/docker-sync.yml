@@ -197,7 +197,21 @@ jobs:
           fi
 
           echo "📥 [Step 1/3] 海外高速拉取镜像并落盘..."
-          skopeo copy --override-os linux --override-arch "$ARCH" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
+          if ! PULL_ERROR=$(skopeo copy --override-os linux --override-arch "$ARCH" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}" 2>&1); then
+            echo "❌ 镜像拉取失败："
+            echo "$PULL_ERROR"
+            if [ -n "$CALLBACK_URL" ]; then
+              ERROR_PAYLOAD=$(jq -n \
+                --arg taskId "$TASK_ID" \
+                --arg error "镜像拉取失败: $PULL_ERROR" \
+                '{taskId: $taskId, status: "failed", error: $error}')
+              curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+                -H "Content-Type: application/json" \
+                -H "X-Callback-Secret: $CALLBACK_SECRET" \
+                -d "$ERROR_PAYLOAD" || true
+            fi
+            exit 1
+          fi
 
           echo "🗜️ [Step 2/3] 启动多核 pigz 极限压缩..."
           pigz -9 -p 4 "$LOCAL_TAR"
