@@ -23,7 +23,7 @@ jobs:
           docker run -d --name alist_worker -p 5244:5244 xhofe/alist:latest > /dev/null
           until curl -s http://127.0.0.1:5244/api/public/settings > /dev/null; do sleep 1; done
 
-          # 设置管理员密码并登录获取绝对有效的 Token
+          # 设置管理员固定密码为 123456
           docker exec alist_worker ./alist admin set 123456 > /dev/null
           
           LOGIN_RES=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login \
@@ -38,15 +38,15 @@ jobs:
           echo "ALIST_TOKEN=$ALIST_TOKEN" >> $GITHUB_ENV
           echo "✅ AList 鉴权凭据就绪"
 
-          # 挂载夸克网盘存储驱动
+          # 使用 jq 内置的 tojson 语法安全序列化 addition 参数
           STORAGE_PAYLOAD=$(jq -n \
             --arg cookie "$CLEAN_COOKIE" \
             '{
-              "mount_path": "/quark",
-              "order": 0,
-              "remark": "temp_driver",
-              "driver": "Quark",
-              "addition": "{\"cookie\":\"" + $cookie + "\",\"root_folder_id\":\"0\"}"
+              mount_path: "/quark",
+              order: 0,
+              remark: "temp_driver",
+              driver: "Quark",
+              addition: ({cookie: $cookie, root_folder_id: "0"} | tojson)
             }')
 
           MOUNT_RES=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
@@ -57,7 +57,7 @@ jobs:
           echo "挂载驱动响应: $MOUNT_RES"
 
           # 验证挂载是否连通夸克
-          sleep 2
+          sleep 3
           CHECK_MOUNT=$(curl -s -X POST http://127.0.0.1:5244/api/fs/list \
             -H "Authorization: $ALIST_TOKEN" \
             -H "Content-Type: application/json" \
