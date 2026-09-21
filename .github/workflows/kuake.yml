@@ -104,7 +104,7 @@ jobs:
           fi
           echo "✅ 测试文件成功落盘至夸克网盘！"
 
-      - name: 3. 穿透夸克官方 API 生成 7 天直链
+      - name: 3. 穿透夸克官方 API 生成真实可用的公开直链
         run: |
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
           
@@ -129,52 +129,46 @@ jobs:
           echo "🔍 1. 查找根目录 docker_images FID..."
           ROOT_JSON=$(call_quark_get "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100")
           ROOT_FID=$(echo "$ROOT_JSON" | jq -r '.data.list[] | select(.file_name=="docker_images") | .fid' 2>/dev/null || echo "")
-          echo "docker_images FID: $ROOT_FID"
 
           echo "🔍 2. 查找分类子目录 ${TEST_DIR} FID..."
           CAT_JSON=$(call_quark_get "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${ROOT_FID}&_size=100")
           CAT_FID=$(echo "$CAT_JSON" | jq -r --arg dir "$TEST_DIR" '.data.list[] | select(.file_name==$dir) | .fid' 2>/dev/null || echo "")
-          echo "${TEST_DIR} 目录 FID: $CAT_FID"
 
           echo "🔍 3. 查找测试文件 ${TEST_FILE} FID..."
           FILE_JSON=$(call_quark_get "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${CAT_FID}&_size=100")
           TARGET_FID=$(echo "$FILE_JSON" | jq -r --arg fn "$TEST_FILE" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
-          echo "文件 FID: $TARGET_FID"
 
           if [ -z "$TARGET_FID" ]; then
             echo "❌ 未能获取到落盘文件的 FID"
             exit 1
           fi
+          echo "✅ 成功锁定文件实体 FID: $TARGET_FID"
 
-          echo "==================== 请求创建官方分享链接 ===================="
-          # 核心验证参数：url_type=0 (公开免密直达), expired_type=3 (7天有效期)
-          SHARE_PAYLOAD=$(jq -n --arg fid "$TARGET_FID" --arg title "$TEST_FILE" '{"fid_list":[$fid],"title":$title,"url_type":0,"expired_type":3}')
+          echo "==================== 请求创建公开免密直达链接 ===================="
+          # 核心修复点：url_type=1 (真正的公开无密直达链接), expired_type=3 (7天有效)
+          SHARE_PAYLOAD=$(jq -n --arg fid "$TARGET_FID" --arg title "$TEST_FILE" '{"fid_list":[$fid],"title":$title,"url_type":1,"expired_type":3}')
           
           STEP1_RES=$(call_quark_post "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" "$SHARE_PAYLOAD")
-          echo "第 1 步创建响应: $STEP1_RES"
+          echo "创建公开分享响应: $STEP1_RES"
 
-          SHARE_ID=$(echo "$STEP1_RES" | jq -r '.data.task_resp.data.share_id // .data.share_id // empty' 2>/dev/null || echo "")
+          # 提取真正的公开分享直链
           SHARE_URL=$(echo "$STEP1_RES" | jq -r '.data.task_resp.data.share_url // .data.share_url // empty' 2>/dev/null || echo "")
-          PASSCODE="无"
-
-          if [ -n "$SHARE_ID" ]; then
-            STEP2_RES=$(call_quark_post "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc" "{\"share_id\":\"$SHARE_ID\"}")
-            echo "第 2 步换取响应: $STEP2_RES"
-            
-            URL_FROM_P2=$(echo "$STEP2_RES" | jq -r '.data.share_url // .data.url // empty' 2>/dev/null || echo "")
-            if [ -n "$URL_FROM_P2" ]; then SHARE_URL="$URL_FROM_P2"; fi
-            
-            FETCH_PASS=$(echo "$STEP2_RES" | jq -r '.data.passcode // .data.pwd // empty' 2>/dev/null || echo "")
-            if [ -n "$FETCH_PASS" ]; then PASSCODE="$FETCH_PASS"; fi
+          
+          # 如果第一步未直接暴露 share_url，从 share_id 拼接真实的外链地址
+          if [ -z "$SHARE_URL" ]; then
+            SHARE_ID=$(echo "$STEP1_RES" | jq -r '.data.task_resp.data.share_id // .data.share_id // empty' 2>/dev/null || echo "")
+            if [ -n "$SHARE_ID" ]; then
+              SHARE_URL="https://pan.quark.cn/s/${SHARE_ID}"
+            fi
           fi
 
           echo "=========================================================="
           if [ -n "$SHARE_URL" ]; then
-            echo "🎉 全链路测试彻底打通！"
-            echo "🔗 夸克官方分享链接: $SHARE_URL"
-            echo "🔑 提取码: $PASSCODE"
+            echo "🎉 真正的公开免密分享链接已生成！"
+            echo "🔗 访问链接: $SHARE_URL"
+            echo "💡 说明: 公开直达，无需提取码，可在任意浏览器直接下载"
           else
-            echo "❌ 未能生成分享链接"
+            echo "❌ 未能提取到合法外链"
             exit 1
           fi
           echo "=========================================================="
