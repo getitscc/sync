@@ -1,13 +1,13 @@
-name: Test Quark Upload And Share
+name: Test Quark Upload And Share (Pure Native)
 
 on:
-  workflow_dispatch: # 仅支持在 GitHub 网页手动点击触发
+  workflow_dispatch: # 仅在 GitHub 网页手动点击运行
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 启动临时 AList 挂载夸克网盘
+      - name: 夸克原生直传与生成分享链接测试
         env:
           QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
         run: |
@@ -16,84 +16,80 @@ jobs:
             exit 1
           fi
 
-          # 启动 AList
-          docker run -d --name alist_test -p 5244:5244 xhofe/alist:latest > /dev/null
-          until curl -s http://127.0.0.1:5244/api/public/settings > /dev/null; do sleep 1; done
-          docker exec alist_test ./alist admin set 123456 > /dev/null
-
-          # 获取内部 Token
-          TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login \
-            -H "Content-Type: application/json" \
-            -d '{"username": "admin", "password": "123456"}' | jq -r '.data.token')
-
-          # 挂载夸克驱动
-          MOUNT_RES=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
-            -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
-            -d "{\"mount_path\":\"/quark\",\"order\":0,\"remark\":\"test\",\"driver\":\"Quark\",\"addition\":\"{\\\"cookie\\\":\\\"$QUARK_COOKIE\\\",\\\"root_folder_id\\\":\\\"0\\\"}\"}")
-          
-          echo "AList Token: $TOKEN"
-          echo "ALIST_TOKEN=$TOKEN" >> $GITHUB_ENV
-          echo "挂载返回: $MOUNT_RES"
-
-      - name: 2. 模拟上传测试文件至夸克网盘
-        run: |
-          TEST_DIR="test_debug"
-          TEST_FILE="test_share_$(date +%s).txt"
-          LOCAL_FILE="/tmp/${TEST_FILE}"
-          echo "Hello Quark! Test file created at $(date)" > "$LOCAL_FILE"
-
-          echo "TEST_DIR=$TEST_DIR" >> $GITHUB_ENV
-          echo "TEST_FILE=$TEST_FILE" >> $GITHUB_ENV
-
-          echo "📁 创建目标文件夹: /quark/${TEST_DIR}..."
-          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
-            -H "Authorization: $ALIST_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"path\": \"/quark/${TEST_DIR}\"}" > /dev/null
-
-          echo "📤 直传测试文件到网盘..."
-          UPLOAD_RES=$(curl -s -X PUT \
-            -H "Authorization: $ALIST_TOKEN" \
-            -H "File-Path: /quark/${TEST_DIR}/${TEST_FILE}" \
-            -H "As-Task: false" \
-            -T "$LOCAL_FILE" \
-            "http://127.0.0.1:5244/api/fs/put")
-
-          echo "上传响应: $UPLOAD_RES"
-          rm -f "$LOCAL_FILE"
-
-      - name: 3. 穿透夸克 API 生成分享链接并打印原始返回
-        env:
-          QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
-        run: |
           CLEAN_COOKIE=$(echo "$QUARK_COOKIE" | sed -e 's/^Cookie:[[:space:]]*//i' | tr -d '\r\n')
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
-
-          echo "🔍 1. 查找目录 ${TEST_DIR} 的 FID..."
-          DIR_LIST=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100" \
+          
+          # 1. 查找或创建根目录 docker_images
+          echo "🔍 1. 获取网盘根目录列表..."
+          ROOT_JSON=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100" \
             -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA")
-          DIR_FID=$(echo "$DIR_LIST" | jq -r --arg dir "$TEST_DIR" '.data.list[] | select(.file_name==$dir) | .fid' 2>/dev/null || echo "")
+          
+          TARGET_DIR_FID=$(echo "$ROOT_JSON" | jq -r '.data.list[] | select(.file_name=="docker_images") | .fid' 2>/dev/null || echo "")
 
-          if [ -z "$DIR_FID" ]; then
-            echo "❌ 未找到目录 ${TEST_DIR}，原始返回: $DIR_LIST"
+          if [ -z "$TARGET_DIR_FID" ]; then
+            echo "📁 未检测到 docker_images 目录，正在创建..."
+            MKDIR_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/file?pr=ucpro&fr=pc" \
+              -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA" -H "Content-Type: application/json" \
+              -d '{"pdir_fid":"0","file_name":"docker_images","dir_init_lock":false}')
+            TARGET_DIR_FID=$(echo "$MKDIR_RES" | jq -r '.data.fid // empty')
+          fi
+
+          echo "✅ 目标保存目录 docker_images FID: $TARGET_DIR_FID"
+
+          # 2. 生成本地测试文件
+          TEST_FILENAME="test_file_$(date +%s).txt"
+          LOCAL_PATH="/tmp/${TEST_FILENAME}"
+          echo "Hello Quark! Direct upload test at $(date)" > "$LOCAL_PATH"
+          FILE_SIZE=$(stat -c%s "$LOCAL_PATH")
+          echo "📦 测试文件: $TEST_FILENAME (大小: ${FILE_SIZE} 字节)"
+
+          # 3. 申请原生上传通道 (pre_upload)
+          echo "📤 2. 申请夸克直传通道..."
+          PRE_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/file/upload/pre?pr=ucpro&fr=pc" \
+            -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA" -H "Content-Type: application/json" \
+            -d "{\"pdir_fid\":\"$TARGET_DIR_FID\",\"file_name\":\"$TEST_FILENAME\",\"size\":$FILE_SIZE}")
+
+          UPLOAD_TASK_ID=$(echo "$PRE_RES" | jq -r '.data.task_id // empty')
+          UPLOAD_URL=$(echo "$PRE_RES" | jq -r '.data.upload_url // empty')
+          UPLOAD_FID=$(echo "$PRE_RES" | jq -r '.data.fid // empty')
+
+          if [ -z "$UPLOAD_TASK_ID" ] && [ -z "$UPLOAD_FID" ]; then
+            echo "❌ 申请上传通道失败，返回报文:"
+            echo "$PRE_RES" | jq . || echo "$PRE_RES"
             exit 1
           fi
-          echo "✅ 目录 FID: $DIR_FID"
 
-          echo "🔍 2. 查找文件 ${TEST_FILE} 的 FID..."
-          FILE_LIST=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${DIR_FID}&_size=100" \
-            -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA")
-          FILE_FID=$(echo "$FILE_LIST" | jq -r --arg fn "$TEST_FILE" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
+          # 4. 执行数据上传
+          if [ -n "$UPLOAD_URL" ] && [ "$UPLOAD_URL" != "null" ]; then
+            echo "⬆️ 正在推流上传文件数据..."
+            curl -s -X PUT "$UPLOAD_URL" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$LOCAL_PATH" > /dev/null
 
-          if [ -z "$FILE_FID" ]; then
-            echo "❌ 未找到文件 ${TEST_FILE}，原始返回: $FILE_LIST"
+            echo "📥 确认提交上传任务..."
+            FINISH_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/file/upload/finish?pr=ucpro&fr=pc" \
+              -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA" -H "Content-Type: application/json" \
+              -d "{\"task_id\":\"$UPLOAD_TASK_ID\"}")
+            UPLOAD_FID=$(echo "$FINISH_RES" | jq -r '.data.fid // empty')
+          fi
+
+          # 5. 校验并获取新文件的 FID
+          if [ -z "$UPLOAD_FID" ]; then
+            sleep 2
+            CHECK_RES=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${TARGET_DIR_FID}&_size=100" \
+              -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA")
+            UPLOAD_FID=$(echo "$CHECK_RES" | jq -r --arg fn "$TEST_FILENAME" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$UPLOAD_FID" ]; then
+            echo "❌ 文件已直传，但未获取到文件 FID"
             exit 1
           fi
-          echo "✅ 文件 FID: $FILE_FID"
+          echo "🎉 文件上传成功！目标文件 FID: $UPLOAD_FID"
 
+          # 6. 生成 7 天公开分享链接 (url_type: 0, expired_type: 3)
           echo "==================== 请求创建分享链接 ===================="
-          # url_type: 0 (直链/无密), expired_type: 3 (7天有效期)
-          SHARE_PAYLOAD=$(jq -n --arg fid "$FILE_FID" --arg title "$TEST_FILE" '{"fid_list":[$fid],"title":$title,"url_type":0,"expired_type":3}')
+          SHARE_PAYLOAD=$(jq -n --arg fid "$UPLOAD_FID" --arg title "$TEST_FILENAME" '{"fid_list":[$fid],"title":$title,"url_type":0,"expired_type":3}')
           
           STEP1_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" \
             -H "Cookie: $CLEAN_COOKIE" \
@@ -125,11 +121,11 @@ jobs:
 
           echo "=========================================================="
           if [ -n "$SHARE_URL" ]; then
-            echo "🎉 测试成功！"
-            echo "🔗 分享链接: $SHARE_URL"
+            echo "🎉 全链路原生测试成功！"
+            echo "🔗 夸克分享直链: $SHARE_URL"
             echo "🔑 密码/提取码: ${PASSCODE:-无}"
           else
-            echo "❌ 未能提取到分享链接，请根据上方打印的原始数据排查字段变化。"
+            echo "❌ 生成分享链接失败，请排查返回报文。"
             exit 1
           fi
           echo "=========================================================="
