@@ -107,19 +107,38 @@ jobs:
               -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"prepared\",\"message\":\"工具链就绪\"}" || true
           fi
 
-      - name: 3. 极限清理 Runner 磁盘空间 (释放 30GB+ 空间)
+      - name: 3. 智能磁盘判断：只在预计缺口 > 1G 时清理
         run: |
-          echo "🧹 [Disk Clean] 开始执行深度空间释放..."
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /usr/local/share/powershell
-          sudo rm -rf /usr/share/swift
-          sudo docker image prune --all --force > /dev/null 2>&1 || true
-          sudo apt-get clean
-          echo "✅ 磁盘深度清理完毕！当前可用磁盘空间: $(df -h / | awk 'NR==2 {print $4}')"
+          AVAILABLE_KB=$(df -Pk / | awk 'NR==2 {print $4}')
+          ESTIMATED_IMAGE_GB=6
+          ESTIMATED_PACK_GB=6
+          EXTRA_BUFFER_GB=2
+          REQUIRED_GB=$((ESTIMATED_IMAGE_GB + ESTIMATED_PACK_GB + EXTRA_BUFFER_GB))
+          REQUIRED_KB=$((REQUIRED_GB * 1024 * 1024))
+          ONE_GB_KB=$((1024 * 1024))
+
+          echo "📊 [Disk Estimate] 预计本次任务需要约 ${REQUIRED_GB} GB，当前可用空间: $AVAILABLE_KB KB"
+
+          if [ "$AVAILABLE_KB" -gt "$REQUIRED_KB" ] && [ "$AVAILABLE_KB" -gt "$((REQUIRED_KB + ONE_GB_KB))" ]; then
+            echo "✅ 磁盘剩余空间大于镜像+打包+额外缓冲，并且超过 1G，不需要清理，当前可用磁盘空间: $(df -h / | awk 'NR==2 {print $4}')"
+          else
+            SHORTAGE_KB=$((REQUIRED_KB - AVAILABLE_KB))
+            if [ "$SHORTAGE_KB" -gt "$ONE_GB_KB" ]; then
+              echo "🧹 [Disk Clean] 预计缺口约 ${SHORTAGE_KB} KB（> 1G），开始清理..."
+              sudo rm -rf /usr/share/dotnet
+              sudo rm -rf /usr/local/lib/android
+              sudo rm -rf /opt/ghc
+              sudo rm -rf /opt/hostedtoolcache/CodeQL
+              sudo rm -rf /usr/local/share/boost
+              sudo rm -rf /usr/local/share/powershell
+              sudo rm -rf /usr/share/swift
+              sudo docker image prune --all --force > /dev/null 2>&1 || true
+              sudo apt-get clean
+              echo "✅ 磁盘清理完毕！当前可用磁盘空间: $(df -h / | awk 'NR==2 {print $4}')"
+            else
+              echo "✅ 当前缺口未超过 1G，按策略不清理，当前可用磁盘空间: $(df -h / | awk 'NR==2 {print $4}')"
+            fi
+          fi
 
       - name: 4. 挂载 AList 临时容器 (安全配置注入)
         env:
