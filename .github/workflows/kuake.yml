@@ -1,4 +1,4 @@
-name: Share Docker Images Directory (Verified Protocol)
+name: Share Docker Images Directory (Accurate Reverse)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ jobs:
   create-shares:
     runs-on: ubuntu-latest
     steps:
-      - name: 批量生成多规格夸克分享链接 (修正私密分享协议)
+      - name: 批量生成多规格夸克分享链接 (完整反向工程标头版)
         env:
           QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
         run: |
@@ -17,28 +17,38 @@ jobs:
           fi
 
           CLEAN_COOKIE=$(echo "$QUARK_COOKIE" | sed -e 's/^Cookie:[[:space:]]*//i' | tr -d '\r\n')
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
-          
-          call_quark_get() {
-            curl -s -X GET "$1" \
-              -b "$CLEAN_COOKIE" \
-              -H "User-Agent: $UA" \
-              -H "Referer: https://pan.quark.cn/" \
-              -H "Origin: https://pan.quark.cn"
-          }
 
-          call_quark_post() {
-            curl -s -X POST "$1" \
-              -b "$CLEAN_COOKIE" \
-              -H "User-Agent: $UA" \
-              -H "Referer: https://pan.quark.cn/" \
-              -H "Origin: https://pan.quark.cn" \
-              -H "Content-Type: application/json;charset=UTF-8" \
-              -d "$2"
+          # 封装精准浏览器指纹请求
+          quark_api() {
+            local method="$1"
+            local url="$2"
+            local data="$3"
+
+            local cmd=(curl -s -X "$method" "$url"
+              -b "$CLEAN_COOKIE"
+              -H 'accept: application/json, text/plain, */*'
+              -H 'accept-language: zh-CN,zh;q=0.9,en;q=0.8'
+              -H 'origin: https://pan.quark.cn'
+              -H 'priority: u=1, i'
+              -H 'referer: https://pan.quark.cn/'
+              -H 'sec-ch-ua: "Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"'
+              -H 'sec-ch-ua-mobile: ?0'
+              -H 'sec-ch-ua-platform: "Windows"'
+              -H 'sec-fetch-dest: empty'
+              -H 'sec-fetch-mode: cors'
+              -H 'sec-fetch-site: same-site'
+              -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+            )
+
+            if [ -n "$data" ]; then
+              cmd+=(-H 'content-type: application/json' -d "$data")
+            fi
+
+            "${cmd[@]}"
           }
 
           echo "🔍 检索 docker_images 根目录 FID..."
-          ROOT_JSON=$(call_quark_get "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100")
+          ROOT_JSON=$(quark_api GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100")
           TARGET_FID=$(echo "$ROOT_JSON" | jq -r '.data.list[] | select(.file_name=="docker_images") | .fid' 2>/dev/null || echo "")
 
           if [ -z "$TARGET_FID" ]; then
@@ -49,7 +59,7 @@ jobs:
 
           create_link() {
             local spec_name="$1"
-            local url_type="$2"      # 1=私密加密(强制要求提取码), 0=公开免密
+            local url_type="$2"      # 1=私密加密, 0=公开免密
             local expired_type="$3"  # 1=永久, 3=7天, 4=30天
 
             echo ""
@@ -62,16 +72,16 @@ jobs:
               --argjson et "$expired_type" \
               '{"fid_list":[$fid], "title":"docker_images", "url_type":$ut, "expired_type":$et}')
 
-            local step1_res=$(call_quark_post "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" "$payload")
+            local step1_res=$(quark_api POST "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" "$payload")
             local task_id=$(echo "$step1_res" | jq -r '.data.task_id // empty' 2>/dev/null || echo "")
             local share_id=$(echo "$step1_res" | jq -r '.data.task_resp.data.share_id // .data.share_id // empty' 2>/dev/null || echo "")
 
-            # 文件夹大任务异步轮询
+            # 异步大任务队列轮询
             if [ -n "$task_id" ] && [ -z "$share_id" ]; then
-              echo "⏳ 等待异步队列完成 (task_id: $task_id)..."
+              echo "⏳ 轮询等待夸克后台完成打包 (task_id: $task_id)..."
               for i in {1..10}; do
                 sleep 2
-                local task_status=$(call_quark_get "https://drive-pc.quark.cn/1/clouddrive/task?pr=ucpro&fr=pc&task_id=${task_id}")
+                local task_status=$(quark_api GET "https://drive-pc.quark.cn/1/clouddrive/task?pr=ucpro&fr=pc&task_id=${task_id}")
                 local status_code=$(echo "$task_status" | jq -r '.data.status // empty' 2>/dev/null || echo "")
                 if [ "$status_code" == "2" ]; then
                   share_id=$(echo "$task_status" | jq -r '.data.share_id // .data.save_as.share_id // .data.task_resp.data.share_id // empty' 2>/dev/null || echo "")
@@ -84,8 +94,8 @@ jobs:
             local passcode="无"
 
             if [ -n "$share_id" ]; then
-              # 向官方密码接口换取真实生效的链接与提取码
-              local step2_res=$(call_quark_post "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc" "{\"share_id\":\"$share_id\"}")
+              # 核心修正处：带上 &uc_param_str= 并注入抓包的全套标头
+              local step2_res=$(quark_api POST "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc&uc_param_str=" "{\"share_id\":\"$share_id\"}")
               
               share_url=$(echo "$step2_res" | jq -r '.data.share_url // .data.url // empty' 2>/dev/null || echo "")
               passcode=$(echo "$step2_res" | jq -r '.data.passcode // .data.pwd // empty' 2>/dev/null || echo "")
@@ -104,17 +114,18 @@ jobs:
               echo "🔗 分享直链: $share_url"
               echo "🔑 真实提取码: $passcode"
             else
-              echo "❌ 【$spec_name】创建失败: $step1_res"
+              echo "❌ 【$spec_name】创建失败"
+              echo "原始返回: $step1_res"
             fi
           }
 
-          # 1. 有密码 · 永久有效 (url_type: 1 代表私密加密, expired_type: 1 代表永久)
+          # 1. 有密码 · 永久有效 (url_type: 1, expired_type: 1)
           create_link "有密码 · 永久有效" 1 1
 
-          # 2. 无密码 · 7天有效 (url_type: 0 代表公开免密, expired_type: 3 代表7天)
+          # 2. 无密码 · 7天有效 (url_type: 0, expired_type: 3)
           create_link "无密码 · 7天有效" 0 3
 
-          # 3. 有密码 · 30天有效 (url_type: 1 代表私密加密, expired_type: 4 代表30天)
+          # 3. 有密码 · 30天有效 (url_type: 1, expired_type: 4)
           create_link "有密码 · 30天有效" 1 4
 
           echo ""
