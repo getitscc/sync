@@ -1,13 +1,13 @@
-name: Test Quark Upload And Share (Pure Native)
+name: Test Quark Upload And Share (Browser Profile)
 
 on:
-  workflow_dispatch: # 仅在 GitHub 网页手动点击运行
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: 夸克原生直传与生成分享链接测试
+      - name: 夸克原生直传与生成分享链接测试 (带真实浏览器指纹)
         env:
           QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
         run: |
@@ -17,58 +17,81 @@ jobs:
           fi
 
           CLEAN_COOKIE=$(echo "$QUARK_COOKIE" | sed -e 's/^Cookie:[[:space:]]*//i' | tr -d '\r\n')
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
-          
-          # 1. 查找或创建根目录 docker_images
+
+          # 封装通用浏览器请求函数
+          call_quark() {
+            local method="$1"
+            local url="$2"
+            local data="$3"
+
+            local cmd=(curl -s -X "$method" "$url"
+              -b "$CLEAN_COOKIE"
+              -H 'accept: application/json, text/plain, */*'
+              -H 'accept-language: zh-CN,zh;q=0.9'
+              -H 'origin: https://pan.quark.cn'
+              -H 'priority: u=1, i'
+              -H 'referer: https://pan.quark.cn/'
+              -H 'sec-ch-ua: "Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"'
+              -H 'sec-ch-ua-mobile: ?0'
+              -H 'sec-ch-ua-platform: "Windows"'
+              -H 'sec-fetch-dest: empty'
+              -H 'sec-fetch-mode: cors'
+              -H 'sec-fetch-site: same-site'
+              -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+            )
+
+            if [ -n "$data" ]; then
+              cmd+=(-H 'content-type: application/json;charset=UTF-8' -d "$data")
+            fi
+
+            "${cmd[@]}"
+          }
+
+          # 1. 查询根目录获取 docker_images FID
           echo "🔍 1. 获取网盘根目录列表..."
-          ROOT_JSON=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100" \
-            -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA")
-          
+          ROOT_JSON=$(call_quark GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100")
           TARGET_DIR_FID=$(echo "$ROOT_JSON" | jq -r '.data.list[] | select(.file_name=="docker_images") | .fid' 2>/dev/null || echo "")
 
           if [ -z "$TARGET_DIR_FID" ]; then
             echo "📁 未检测到 docker_images 目录，正在创建..."
-            MKDIR_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/file?pr=ucpro&fr=pc" \
-              -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA" -H "Content-Type: application/json" \
-              -d '{"pdir_fid":"0","file_name":"docker_images","dir_init_lock":false}')
+            MKDIR_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/file?pr=ucpro&fr=pc" '{"pdir_fid":"0","file_name":"docker_images","dir_init_lock":false}')
             TARGET_DIR_FID=$(echo "$MKDIR_RES" | jq -r '.data.fid // empty')
           fi
-
           echo "✅ 目标保存目录 docker_images FID: $TARGET_DIR_FID"
 
-          # 2. 生成本地测试文件并计算 MD5
-          TEST_FILENAME="test_file_$(date +%s).txt"
+          # 2. 生成本地测试文件并计算属性
+          TEST_FILENAME="test_file_$(date +%s).tar"
           LOCAL_PATH="/tmp/${TEST_FILENAME}"
-          echo "Hello Quark! Direct upload test at $(date)" > "$LOCAL_PATH"
+          echo "Hello Quark Direct Upload" > "$LOCAL_PATH"
           FILE_SIZE=$(stat -c%s "$LOCAL_PATH")
           FILE_MD5=$(md5sum "$LOCAL_PATH" | awk '{print $1}')
           
-          echo "📦 测试文件: $TEST_FILENAME"
-          echo "📏 文件大小: ${FILE_SIZE} 字节"
-          echo "🔑 文件 MD5: $FILE_MD5"
+          echo "📦 测试文件: $TEST_FILENAME (大小: ${FILE_SIZE} 字节, MD5: $FILE_MD5)"
 
-          # 3. 申请原生上传通道 (带入 md5 校验参数)
+          # 3. 申请原生直传通道
           echo "📤 2. 申请夸克直传通道..."
           PRE_PAYLOAD=$(jq -n \
             --arg pdir "$TARGET_DIR_FID" \
             --arg name "$TEST_FILENAME" \
             --argjson size "$FILE_SIZE" \
             --arg md5 "$FILE_MD5" \
-            '{"pdir_fid":$pdir, "file_name":$name, "size":$size, "md5":$md5}')
+            '{
+              pdir_fid: $pdir,
+              file_name: $name,
+              size: $size,
+              md5: $md5,
+              format_type: "other",
+              ccp_hash_update: true
+            }')
 
-          PRE_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/file/upload/pre?pr=ucpro&fr=pc" \
-            -H "Cookie: $CLEAN_COOKIE" \
-            -H "User-Agent: $UA" \
-            -H "Content-Type: application/json" \
-            -d "$PRE_PAYLOAD")
-
+          PRE_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/file/upload/pre?pr=ucpro&fr=pc" "$PRE_PAYLOAD")
           echo "通道响应: $PRE_RES"
 
           UPLOAD_TASK_ID=$(echo "$PRE_RES" | jq -r '.data.task_id // empty')
           UPLOAD_URL=$(echo "$PRE_RES" | jq -r '.data.upload_url // empty')
           UPLOAD_FID=$(echo "$PRE_RES" | jq -r '.data.fid // empty')
 
-          # 4. 执行数据上传（若未触发秒传则 PUT 推流）
+          # 4. 执行数据推流
           if [ -n "$UPLOAD_URL" ] && [ "$UPLOAD_URL" != "null" ]; then
             echo "⬆️ 正在推流上传文件数据..."
             curl -s -X PUT "$UPLOAD_URL" \
@@ -76,17 +99,14 @@ jobs:
               --data-binary @"$LOCAL_PATH" > /dev/null
 
             echo "📥 确认提交上传任务..."
-            FINISH_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/file/upload/finish?pr=ucpro&fr=pc" \
-              -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA" -H "Content-Type: application/json" \
-              -d "{\"task_id\":\"$UPLOAD_TASK_ID\"}")
+            FINISH_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/file/upload/finish?pr=ucpro&fr=pc" "{\"task_id\":\"$UPLOAD_TASK_ID\"}")
             UPLOAD_FID=$(echo "$FINISH_RES" | jq -r '.data.fid // empty')
           fi
 
-          # 5. 校验并获取新文件的 FID
+          # 5. 确保拿到文件 FID
           if [ -z "$UPLOAD_FID" ]; then
             sleep 2
-            CHECK_RES=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${TARGET_DIR_FID}&_size=100" \
-              -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA")
+            CHECK_RES=$(call_quark GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${TARGET_DIR_FID}&_size=100")
             UPLOAD_FID=$(echo "$CHECK_RES" | jq -r --arg fn "$TEST_FILENAME" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
           fi
 
@@ -96,16 +116,11 @@ jobs:
           fi
           echo "🎉 文件就绪！目标文件 FID: $UPLOAD_FID"
 
-          # 6. 生成 7 天公开分享链接 (url_type: 0, expired_type: 3)
+          # 6. 生成 7 天分享直链 (url_type: 0, expired_type: 3)
           echo "==================== 请求创建分享链接 ===================="
           SHARE_PAYLOAD=$(jq -n --arg fid "$UPLOAD_FID" --arg title "$TEST_FILENAME" '{"fid_list":[$fid],"title":$title,"url_type":0,"expired_type":3}')
           
-          STEP1_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" \
-            -H "Cookie: $CLEAN_COOKIE" \
-            -H "User-Agent: $UA" \
-            -H "Content-Type: application/json;charset=UTF-8" \
-            -d "$SHARE_PAYLOAD")
-
+          STEP1_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" "$SHARE_PAYLOAD")
           echo "📦 [原始数据] 第 1 步创建返回:"
           echo "$STEP1_RES" | jq . || echo "$STEP1_RES"
 
@@ -115,12 +130,7 @@ jobs:
 
           if [ -n "$SHARE_ID" ] && [ -z "$SHARE_URL" ]; then
             echo "🔄 [步骤换取] share_url 为空，调用 /share/password 获取..."
-            STEP2_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc" \
-              -H "Cookie: $CLEAN_COOKIE" \
-              -H "User-Agent: $UA" \
-              -H "Content-Type: application/json;charset=UTF-8" \
-              -d "{\"share_id\":\"$SHARE_ID\"}")
-
+            STEP2_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc" "{\"share_id\":\"$SHARE_ID\"}")
             echo "🔑 [原始数据] 第 2 步换取返回:"
             echo "$STEP2_RES" | jq . || echo "$STEP2_RES"
 
@@ -130,7 +140,7 @@ jobs:
 
           echo "=========================================================="
           if [ -n "$SHARE_URL" ]; then
-            echo "🎉 全链路原生测试成功！"
+            echo "🎉 全链路测试成功！"
             echo "🔗 夸克分享直链: $SHARE_URL"
             echo "🔑 密码/提取码: ${PASSCODE:-无}"
           else
