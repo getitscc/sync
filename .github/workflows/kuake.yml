@@ -36,30 +36,39 @@ jobs:
 
           echo "✅ 目标保存目录 docker_images FID: $TARGET_DIR_FID"
 
-          # 2. 生成本地测试文件
+          # 2. 生成本地测试文件并计算 MD5
           TEST_FILENAME="test_file_$(date +%s).txt"
           LOCAL_PATH="/tmp/${TEST_FILENAME}"
           echo "Hello Quark! Direct upload test at $(date)" > "$LOCAL_PATH"
           FILE_SIZE=$(stat -c%s "$LOCAL_PATH")
-          echo "📦 测试文件: $TEST_FILENAME (大小: ${FILE_SIZE} 字节)"
+          FILE_MD5=$(md5sum "$LOCAL_PATH" | awk '{print $1}')
+          
+          echo "📦 测试文件: $TEST_FILENAME"
+          echo "📏 文件大小: ${FILE_SIZE} 字节"
+          echo "🔑 文件 MD5: $FILE_MD5"
 
-          # 3. 申请原生上传通道 (pre_upload)
+          # 3. 申请原生上传通道 (带入 md5 校验参数)
           echo "📤 2. 申请夸克直传通道..."
+          PRE_PAYLOAD=$(jq -n \
+            --arg pdir "$TARGET_DIR_FID" \
+            --arg name "$TEST_FILENAME" \
+            --argjson size "$FILE_SIZE" \
+            --arg md5 "$FILE_MD5" \
+            '{"pdir_fid":$pdir, "file_name":$name, "size":$size, "md5":$md5}')
+
           PRE_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/file/upload/pre?pr=ucpro&fr=pc" \
-            -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA" -H "Content-Type: application/json" \
-            -d "{\"pdir_fid\":\"$TARGET_DIR_FID\",\"file_name\":\"$TEST_FILENAME\",\"size\":$FILE_SIZE}")
+            -H "Cookie: $CLEAN_COOKIE" \
+            -H "User-Agent: $UA" \
+            -H "Content-Type: application/json" \
+            -d "$PRE_PAYLOAD")
+
+          echo "通道响应: $PRE_RES"
 
           UPLOAD_TASK_ID=$(echo "$PRE_RES" | jq -r '.data.task_id // empty')
           UPLOAD_URL=$(echo "$PRE_RES" | jq -r '.data.upload_url // empty')
           UPLOAD_FID=$(echo "$PRE_RES" | jq -r '.data.fid // empty')
 
-          if [ -z "$UPLOAD_TASK_ID" ] && [ -z "$UPLOAD_FID" ]; then
-            echo "❌ 申请上传通道失败，返回报文:"
-            echo "$PRE_RES" | jq . || echo "$PRE_RES"
-            exit 1
-          fi
-
-          # 4. 执行数据上传
+          # 4. 执行数据上传（若未触发秒传则 PUT 推流）
           if [ -n "$UPLOAD_URL" ] && [ "$UPLOAD_URL" != "null" ]; then
             echo "⬆️ 正在推流上传文件数据..."
             curl -s -X PUT "$UPLOAD_URL" \
@@ -82,10 +91,10 @@ jobs:
           fi
 
           if [ -z "$UPLOAD_FID" ]; then
-            echo "❌ 文件已直传，但未获取到文件 FID"
+            echo "❌ 文件未成功存入网盘"
             exit 1
           fi
-          echo "🎉 文件上传成功！目标文件 FID: $UPLOAD_FID"
+          echo "🎉 文件就绪！目标文件 FID: $UPLOAD_FID"
 
           # 6. 生成 7 天公开分享链接 (url_type: 0, expired_type: 3)
           echo "==================== 请求创建分享链接 ===================="
@@ -125,7 +134,7 @@ jobs:
             echo "🔗 夸克分享直链: $SHARE_URL"
             echo "🔑 密码/提取码: ${PASSCODE:-无}"
           else
-            echo "❌ 生成分享链接失败，请排查返回报文。"
+            echo "❌ 生成分享链接失败"
             exit 1
           fi
           echo "=========================================================="
