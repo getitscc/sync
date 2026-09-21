@@ -84,6 +84,7 @@ jobs:
           echo "SAFE_FILENAME=$SAFE_FILENAME" >> $GITHUB_ENV
           echo "CATEGORY_DIR=$CATEGORY_DIR" >> $GITHUB_ENV
           echo "LOCAL_TAR=$LOCAL_TAR" >> $GITHUB_ENV
+          echo "TARGET_DIR=$TARGET_DIR" >> $GITHUB_ENV
           echo "CALLBACK_URL=$CALLBACK_URL" >> $GITHUB_ENV
 
           if [ -n "$CALLBACK_URL" ]; then
@@ -106,35 +107,33 @@ jobs:
               -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"prepared\",\"message\":\"工具链就绪\"}" || true
           fi
 
-      - name: 3. 智能预估镜像大小与按需清理磁盘
+      - name: 3. 极限清理 Runner 磁盘空间 (释放 30GB+ 空间)
         run: |
-          RAW_MANIFEST=$(skopeo inspect --raw "docker://${FULL_IMAGE}" || echo "{}")
-          MEDIA_TYPE=$(echo "$RAW_MANIFEST" | jq -r '.mediaType // empty' 2>/dev/null || true)
+          echo "🧹 [Disk Clean] 开始执行深度空间释放..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/share/swift
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          sudo apt-get clean
+          echo "✅ 磁盘深度清理完毕！当前可用磁盘空间: $(df -h / | awk 'NR==2 {print $4}')"
 
-          if [ "$MEDIA_TYPE" = "application/vnd.docker.distribution.manifest.list.v2+json" ] || [ "$MEDIA_TYPE" = "application/vnd.oci.image.index.v1+json" ]; then
-              DIGEST=$(echo "$RAW_MANIFEST" | jq -r --arg arch "$ARCH" '.manifests[] | select(.platform.architecture == $arch) | .digest' 2>/dev/null | head -n 1)
-              if [ -n "$DIGEST" ] && [ "$DIGEST" != "null" ]; then
-                  IMAGE_WITHOUT_TAG="${FULL_IMAGE%%:*}"
-                  RAW_MANIFEST=$(skopeo inspect --raw "docker://${IMAGE_WITHOUT_TAG}@${DIGEST}" || echo "{}")
-              fi
-          fi
-
-          COMPRESSED_SIZE=$(echo "$RAW_MANIFEST" | jq -r '[.layers[].size] | add // 0' 2>/dev/null || echo 0)
-          ESTIMATED_MB=$(( COMPRESSED_SIZE * 3 / 1024 / 1024 ))
-          FREE_SPACE_MB=$(df -m / | awk 'NR==2 {print $4}')
-
-          if [ "$ESTIMATED_MB" -ge 10240 ] || [ $((FREE_SPACE_MB - ESTIMATED_MB)) -lt 5120 ]; then
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            sudo docker image prune --all --force > /dev/null 2>&1 || true
-            sudo apt-get clean
-          fi
-
-      - name: 4. 挂载 AList 临时容器 (增强容错捕获)
+      - name: 4. 挂载 AList 临时容器 (安全配置注入)
         env:
           QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
-          if [ -z "$QUARK_COOKIE" ]; then echo "❌ 缺少 QUARK_COOKIE Secret"; exit 1; fi
+          if [ -z "$QUARK_COOKIE" ]; then
+            echo "❌ 缺少 QUARK_COOKIE Secret"
+            exit 1
+          fi
+
+          CLEAN_COOKIE=$(echo "$QUARK_COOKIE" | sed -e 's/^Cookie:[[:space:]]*//i' | tr -d '\r\n')
+          echo "CLEAN_COOKIE=$CLEAN_COOKIE" >> $GITHUB_ENV
+
           docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null
           until curl -s http://127.0.0.1:5244/api/public/settings > /dev/null; do sleep 1; done
           docker exec alist_sync ./alist admin set 123456 > /dev/null
@@ -142,51 +141,72 @@ jobs:
           TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login -H "Content-Type: application/json" -d '{"username": "admin", "password": "123456"}' | jq -r '.data.token' 2>/dev/null)
           
           if [ -z "$TOKEN" ] || [ "$TOKEN" == "null" ]; then
-            echo "❌ AList 内部登录获取 Token 失败!"
+            echo "❌ AList 获取 Token 失败!"
             curl -sS -o /dev/null -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"status\":\"failed\",\"error\":\"AList 核心服务异常，获取凭证失败\"}" || true
             exit 1
           fi
           echo "ALIST_TOKEN=$TOKEN" >> $GITHUB_ENV
 
+          STORAGE_PAYLOAD=$(jq -n \
+            --arg cookie "$CLEAN_COOKIE" \
+            '{
+              mount_path: "/quark",
+              order: 0,
+              remark: "temp_driver",
+              driver: "Quark",
+              addition: ({cookie: $cookie, root_folder_id: "0"} | tojson)
+            }')
+
           MOUNT_RES=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
-            -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
-            -d '{"mount_path": "/quark","order": 0,"remark": "temp_driver","driver": "Quark","addition": "{\"cookie\":\"'"$QUARK_COOKIE"'\",\"root_folder_id\":\"0\"}"}')
+            -H "Authorization: $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$STORAGE_PAYLOAD")
             
           MOUNT_CODE=$(echo "$MOUNT_RES" | jq -r '.code // 500' 2>/dev/null)
           if [ "$MOUNT_CODE" != "200" ]; then
              ERR_MSG=$(echo "$MOUNT_RES" | jq -r '.message // "未知"' 2>/dev/null)
-             curl -sS -o /dev/null -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"status\":\"failed\",\"error\":\"夸克网盘挂载失败，Cookie可能已过期: $ERR_MSG\"}" || true
+             curl -sS -o /dev/null -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"status\":\"failed\",\"error\":\"夸克网盘挂载失败，Cookie 可能失效: $ERR_MSG\"}" || true
              exit 1
           fi
 
-      - name: 5. 跨国满速拉取、压缩与上传 (异常穿透到前端)
+      - name: 5. 跨国满速拉取、极速压缩与大文件直传
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
-          curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"拉取并压缩中，镜像较大时可能较久\"}" || true
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在拉取并极速压缩镜像中...\"}" || true
+          fi
+
+          echo "📥 [Step 1/3] 海外高速拉取镜像并落盘..."
           skopeo copy --override-os linux --override-arch "$ARCH" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
 
+          echo "🗜️ [Step 2/3] 启动多核 pigz 极限压缩..."
           pigz -9 -p 4 "$LOCAL_TAR"
           mv "${LOCAL_TAR}.gz" "$LOCAL_TAR"
 
-          echo "📁 检测并创建夸克网盘目标文件夹..."
-          MKDIR_RES=$(curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" -d '{"path": "/quark/docker_images/'"$CATEGORY_DIR"'"}')
-          MKDIR_CODE=$(echo "$MKDIR_RES" | jq -r '.code // 500' 2>/dev/null || echo "500")
-          if [ "$MKDIR_CODE" != "200" ]; then
-             ERR_MSG=$(echo "$MKDIR_RES" | jq -r '.message // "未知错误"' 2>/dev/null)
-             curl -sS -o /dev/null -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"status\":\"failed\",\"error\":\"夸克创建目录失败: $ERR_MSG\"}" || true
-             exit 1
-          fi
+          FILE_SIZE=$(stat -c%s "$LOCAL_TAR")
+          FILE_SIZE_MB=$(( FILE_SIZE / 1024 / 1024 ))
+          echo "✅ 压缩完毕！最终转存体积大幅缩小至: ${FILE_SIZE_MB} MB"
+
+          echo "📁 检测并创建夸克网盘目标分类目录..."
+          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" -d '{"path": "/quark/docker_images/'"$CATEGORY_DIR"'"}' > /dev/null
 
           if [ "$TAG" == "latest" ]; then
+            echo "🗑️ 检测到 latest 版本，正在调用原生 API 抹除旧文件以便更新..."
             curl -s -X POST http://127.0.0.1:5244/api/fs/remove -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" -d '{"dir": "/quark/docker_images/'"$CATEGORY_DIR"'", "names": ["'"$SAFE_FILENAME"'"]}' > /dev/null
           fi
 
-          echo "📤 开始上传网盘..."
-          curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"uploading\",\"message\":\"正在直传夸克网盘\"}" || true
-          
-          # 将 curl 输出内容保存，防止破坏脚本终端流
-          curl -X PUT -# -H "Authorization: $ALIST_TOKEN" -H "File-Path: /quark/docker_images/${CATEGORY_DIR}/${SAFE_FILENAME}" -H "As-Task: false" -T "$LOCAL_TAR" "http://127.0.0.1:5244/api/fs/put" | tee upload_res.json
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"uploading\",\"message\":\"正在直传夸克网盘（请查看终端进度条）\"}" || true
+          fi
+
+          echo "📤 [Step 3/3] 调用原生 API 直传夸克..."
+          curl -X PUT -# \
+            -H "Authorization: $ALIST_TOKEN" \
+            -H "File-Path: /quark/docker_images/${CATEGORY_DIR}/${SAFE_FILENAME}" \
+            -H "As-Task: false" \
+            -T "$LOCAL_TAR" \
+            "http://127.0.0.1:5244/api/fs/put" | tee upload_res.json
           
           UPLOAD_CODE=$(jq -r '.code // 500' upload_res.json 2>/dev/null || echo "500")
           if [ "$UPLOAD_CODE" != "200" ]; then
@@ -195,48 +215,132 @@ jobs:
              exit 1
           fi
 
-          rm -f "$LOCAL_TAR"
+          rm -f "$LOCAL_TAR" upload_res.json
 
-      - name: 6. 整理最终回调 (防 JSON 解析猝死版)
+      - name: 6. 逆向官方 API 生成永久加密分享直链并回调
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
-          SHARE_URL=""
-          SHARE_PWD=""
-          SHARE_EXPIRE=""
-          FAIL_REASON=""
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"sharing\",\"message\":\"正在生成夸克加密分享链接...\"}" || true
+          fi
 
-          if [ "${{ job.status }}" == "success" ]; then
-            SHARE_JSON=$(curl -s -X POST http://127.0.0.1:5244/api/fs/new_share \
-              -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
-              -d "{\"dirs\":[],\"files\":[\"/quark/docker_images/${CATEGORY_DIR}/${SAFE_FILENAME}\"],\"expires_in\":0}" || echo "{}")
-            
-            API_CODE=$(echo "$SHARE_JSON" | jq -r '.code // 500' 2>/dev/null || echo "500")
-            if [ "$API_CODE" != "200" ]; then
-               FAIL_REASON="生成网盘分享直链被拒绝: $(echo "$SHARE_JSON" | jq -r '.message // "未知错误"' 2>/dev/null)"
-            else
-               SHARE_CODE_RAW=$(echo "$SHARE_JSON" | jq -r '.data.urls.urls // .data.url // empty' 2>/dev/null || echo "")
-               SHARE_PWD=$(echo "$SHARE_JSON" | jq -r '.data.password // empty' 2>/dev/null || echo "")
-               if [ -n "$SHARE_CODE_RAW" ]; then
-                 SHARE_URL="${ALIST_PUBLIC_BASE:-https://alist.example.com/s/}${SHARE_CODE_RAW}"
-               fi
+          call_quark() {
+            local method="$1"
+            local url="$2"
+            local data="$3"
+            local cmd=(curl -s -X "$method" "$url"
+              -b "$CLEAN_COOKIE"
+              -H 'accept: application/json, text/plain, */*'
+              -H 'accept-language: zh-CN,zh;q=0.9,en;q=0.8'
+              -H 'origin: https://pan.quark.cn'
+              -H 'priority: u=1, i'
+              -H 'referer: https://pan.quark.cn/'
+              -H 'sec-ch-ua: "Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"'
+              -H 'sec-ch-ua-mobile: ?0'
+              -H 'sec-ch-ua-platform: "Windows"'
+              -H 'sec-fetch-dest: empty'
+              -H 'sec-fetch-mode: cors'
+              -H 'sec-fetch-site: same-site'
+              -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+            )
+            if [ -n "$data" ]; then
+              cmd+=(-H 'content-type: application/json' -d "$data")
+            fi
+            "${cmd[@]}"
+          }
+
+          echo "🔍 检索网盘目标文件 FID..."
+          ROOT_JSON=$(call_quark GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100")
+          ROOT_FID=$(echo "$ROOT_JSON" | jq -r '.data.list[] | select(.file_name=="docker_images") | .fid' 2>/dev/null || echo "")
+
+          CAT_FID=""
+          if [ -n "$ROOT_FID" ]; then
+            CAT_JSON=$(call_quark GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${ROOT_FID}&_size=100")
+            CAT_FID=$(echo "$CAT_JSON" | jq -r --arg cat "$CATEGORY_DIR" '.data.list[] | select(.file_name==$cat) | .fid' 2>/dev/null || echo "")
+          fi
+
+          TARGET_FID=""
+          if [ -n "$CAT_FID" ]; then
+            FILE_JSON=$(call_quark GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${CAT_FID}&_size=100")
+            TARGET_FID=$(echo "$FILE_JSON" | jq -r --arg fn "$SAFE_FILENAME" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
+          fi
+
+          SHARE_URL=""
+          PASSCODE=""
+
+          if [ -n "$TARGET_FID" ]; then
+            # 随机生成 4 位大小写字母+数字提取码
+            PASSCODE=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 4)
+
+            # 采用抓包严格对应的 url_type: 2, expired_type: 1 (永久有效)
+            SHARE_PAYLOAD=$(jq -n \
+              --arg fid "$TARGET_FID" \
+              --arg pwd "$PASSCODE" \
+              --arg title "$SAFE_FILENAME" \
+              '{
+                "fid_list": [$fid],
+                "title": $title,
+                "url_type": 2,
+                "passcode": $pwd,
+                "expired_type": 1,
+                "support_error_code": ["41060"]
+              }')
+
+            SHARE_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc&uc_param_str=" "$SHARE_PAYLOAD")
+            TASK_QUEUE_ID=$(echo "$SHARE_RES" | jq -r '.data.task_id // empty' 2>/dev/null || echo "")
+            SHARE_ID=$(echo "$SHARE_RES" | jq -r '.data.task_resp.data.share_id // .data.share_id // empty' 2>/dev/null || echo "")
+
+            # 兼容异步任务队列
+            if [ -n "$TASK_QUEUE_ID" ] && [ -z "$SHARE_ID" ]; then
+              for i in {0..10}; do
+                sleep 2
+                TASK_STATUS=$(call_quark GET "https://drive-pc.quark.cn/1/clouddrive/task?pr=ucpro&fr=pc&uc_param_str=&task_id=${TASK_QUEUE_ID}&retry_index=${i}")
+                if [ "$(echo "$TASK_STATUS" | jq -r '.data.status // empty' 2>/dev/null)" == "2" ]; then
+                  SHARE_ID=$(echo "$TASK_STATUS" | jq -r '.data.share_id // .data.save_as.share_id // .data.task_resp.data.share_id // empty' 2>/dev/null || echo "")
+                  break
+                fi
+              done
+            fi
+
+            # 换取真实外链
+            if [ -n "$SHARE_ID" ]; then
+              PWD_RES=$(call_quark POST "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc&uc_param_str=" "{\"share_id\":\"$SHARE_ID\"}")
+              SHARE_URL=$(echo "$PWD_RES" | jq -r '.data.share_url // .data.url // empty' 2>/dev/null || echo "")
+              
+              if [ -z "$SHARE_URL" ]; then
+                PWD_ID=$(echo "$PWD_RES" | jq -r '.data.pwd_id // empty' 2>/dev/null || echo "")
+                if [ -n "$PWD_ID" ]; then
+                  SHARE_URL="https://pan.quark.cn/s/${PWD_ID}"
+                else
+                  SHARE_URL="https://pan.quark.cn/s/${SHARE_id}"
+                fi
+              fi
             fi
           fi
 
           DIGEST="$(skopeo inspect --format '{{.Digest}}' "docker://$FULL_IMAGE" 2>/dev/null || echo "")"
 
+          echo "=========================================================="
+          echo "🔗 分享直链: ${SHARE_URL:-获取失败}"
+          echo "🔑 真实提取码: $PASSCODE"
+          echo "=========================================================="
+
+          # 最终向 Cloudflare Worker 投递终态
           if [ -n "$CALLBACK_URL" ]; then
+            STATUS="$( [ -n "$SHARE_URL" ] && echo uploaded || echo failed )"
+            ERROR_MSG="$( [ -z "$SHARE_URL" ] && echo "镜像已上传网盘，但官方分享链接生成失败" || echo "" )"
+
             PAYLOAD=$(jq -n \
               --arg taskId "$TASK_ID" \
-              --arg status "$( [ -n "$SHARE_URL" ] && echo uploaded || echo failed )" \
-              --arg error "$FAIL_REASON" \
+              --arg status "$STATUS" \
+              --arg error "$ERROR_MSG" \
               --arg imageBase "$IMAGE_BASE" \
               --arg imageName "$FULL_IMAGE" \
               --arg tag "$TAG" \
               --arg arch "$ARCH" \
               --arg shareUrl "$SHARE_URL" \
-              --arg password "$SHARE_PWD" \
-              --arg expireAt "$SHARE_EXPIRE" \
+              --arg passcode "$PASSCODE" \
               --arg digest "$DIGEST" \
               '{
                 taskId: $taskId,
@@ -246,13 +350,10 @@ jobs:
                 imageName: $imageName,
                 tag: $tag,
                 arch: $arch,
-                fileName: $ENV.SAFE_FILENAME | if . then . else "" end,
                 shareUrl: $shareUrl,
-                password: $password,
-                expireAt: $expireAt,
+                passcode: $passcode,
                 digest: $digest
               }')
-
             PAYLOAD=$(echo "$PAYLOAD" | jq --arg fn "$SAFE_FILENAME" '.fileName = $fn')
 
             curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
