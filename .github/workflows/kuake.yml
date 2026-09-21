@@ -1,153 +1,135 @@
-name: Test Quark Upload & Share Directly
+name: Test Quark Upload And Share
 
 on:
-  workflow_dispatch:
-    inputs:
-      test_file_name:
-        description: '测试文件名 (建议保持 .tar 后缀)'
-        required: true
-        default: 'test_demo_amd64.tar'
+  workflow_dispatch: # 仅支持在 GitHub 网页手动点击触发
 
 jobs:
-  test_share:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 检查环境变量并准备测试文件
-        run: |
-          if [ -z "${{ secrets.QUARK_COOKIE }}" ]; then
-            echo "❌ 错误: 仓库中未配置 QUARK_COOKIE Secret！"
-            exit 1
-          fi
-          
-          FILE_NAME="${{ github.event.inputs.test_file_name }}"
-          echo "TEST_FILE=$FILE_NAME" >> $GITHUB_ENV
-          
-          # 创建一个 1MB 大小的本地测试归档文件
-          dd if=/dev/zero of="/tmp/$FILE_NAME" bs=1M count=1
-          echo "✅ 本地测试文件已生成: /tmp/$FILE_NAME (大小: 1MB)"
-
-      - name: 2. 启动临时 AList 挂载夸克网盘
+      - name: 1. 启动临时 AList 挂载夸克网盘
         env:
           QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
         run: |
-          echo "🚀 启动 AList 容器..."
+          if [ -z "$QUARK_COOKIE" ]; then
+            echo "❌ 缺少 secrets.QUARK_COOKIE"
+            exit 1
+          fi
+
+          # 启动 AList
           docker run -d --name alist_test -p 5244:5244 xhofe/alist:latest > /dev/null
           until curl -s http://127.0.0.1:5244/api/public/settings > /dev/null; do sleep 1; done
           docker exec alist_test ./alist admin set 123456 > /dev/null
 
+          # 获取内部 Token
           TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login \
             -H "Content-Type: application/json" \
             -d '{"username": "admin", "password": "123456"}' | jq -r '.data.token')
 
-          echo "ALIST_TOKEN=$TOKEN" >> $GITHUB_ENV
-
-          echo "☁️ 挂载夸克驱动..."
+          # 挂载夸克驱动
           MOUNT_RES=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
             -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
-            -d '{"mount_path": "/quark","order": 0,"remark": "test_driver","driver": "Quark","addition": "{\"cookie\":\"'"$QUARK_COOKIE"'\",\"root_folder_id\":\"0\"}"}')
+            -d "{\"mount_path\":\"/quark\",\"order\":0,\"remark\":\"test\",\"driver\":\"Quark\",\"addition\":\"{\\\"cookie\\\":\\\"$QUARK_COOKIE\\\",\\\"root_folder_id\\\":\\\"0\\\"}\"}")
           
+          echo "AList Token: $TOKEN"
+          echo "ALIST_TOKEN=$TOKEN" >> $GITHUB_ENV
           echo "挂载返回: $MOUNT_RES"
 
-      - name: 3. 上传文件到夸克 /docker_images/test/
+      - name: 2. 模拟上传测试文件至夸克网盘
         run: |
-          echo "📁 创建目标文件夹..."
+          TEST_DIR="test_debug"
+          TEST_FILE="test_share_$(date +%s).txt"
+          LOCAL_FILE="/tmp/${TEST_FILE}"
+          echo "Hello Quark! Test file created at $(date)" > "$LOCAL_FILE"
+
+          echo "TEST_DIR=$TEST_DIR" >> $GITHUB_ENV
+          echo "TEST_FILE=$TEST_FILE" >> $GITHUB_ENV
+
+          echo "📁 创建目标文件夹: /quark/${TEST_DIR}..."
           curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
             -H "Authorization: $ALIST_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{"path": "/quark/docker_images/test"}' > /dev/null
+            -d "{\"path\": \"/quark/${TEST_DIR}\"}" > /dev/null
 
-          echo "📤 直传文件至夸克网盘..."
-          curl -X PUT -# \
+          echo "📤 直传测试文件到网盘..."
+          UPLOAD_RES=$(curl -s -X PUT \
             -H "Authorization: $ALIST_TOKEN" \
-            -H "File-Path: /quark/docker_images/test/${TEST_FILE}" \
+            -H "File-Path: /quark/${TEST_DIR}/${TEST_FILE}" \
             -H "As-Task: false" \
-            -T "/tmp/${TEST_FILE}" \
-            "http://127.0.0.1:5244/api/fs/put" | tee upload_res.json
-          
-          echo ""
-          echo "✅ 上传阶段结束"
+            -T "$LOCAL_FILE" \
+            "http://127.0.0.1:5244/api/fs/put")
 
-      - name: 4. 穿透官方 PC API 创建 7 天分享并打印
+          echo "上传响应: $UPLOAD_RES"
+          rm -f "$LOCAL_FILE"
+
+      - name: 3. 穿透夸克 API 生成分享链接并打印原始返回
         env:
           QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
         run: |
           CLEAN_COOKIE=$(echo "$QUARK_COOKIE" | sed -e 's/^Cookie:[[:space:]]*//i' | tr -d '\r\n')
-          COMMON_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
 
-          echo "========================================================"
-          echo "🔍 正在检索刚上传的测试文件 fid..."
-          
-          # 1. 查找 docker_images 根目录
-          ROOT_RES=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100" \
-            -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $COMMON_UA")
-          ROOT_FID=$(echo "$ROOT_RES" | jq -r '.data.list[] | select(.file_name=="docker_images") | .fid' 2>/dev/null || echo "")
-          echo "docker_images FID: $ROOT_FID"
+          echo "🔍 1. 查找目录 ${TEST_DIR} 的 FID..."
+          DIR_LIST=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100" \
+            -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA")
+          DIR_FID=$(echo "$DIR_LIST" | jq -r --arg dir "$TEST_DIR" '.data.list[] | select(.file_name==$dir) | .fid' 2>/dev/null || echo "")
 
-          # 2. 查找 test 子目录
-          CAT_FID=""
-          if [ -n "$ROOT_FID" ]; then
-            CAT_RES=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${ROOT_FID}&_size=100" \
-              -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $COMMON_UA")
-            CAT_FID=$(echo "$CAT_RES" | jq -r '.data.list[] | select(.file_name=="test") | .fid' 2>/dev/null || echo "")
-            echo "test 目录 FID: $CAT_FID"
-          fi
-
-          # 3. 查找测试文件 fid
-          TARGET_FID=""
-          if [ -n "$CAT_FID" ]; then
-            FILE_RES=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${CAT_FID}&_size=100" \
-              -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $COMMON_UA")
-            TARGET_FID=$(echo "$FILE_RES" | jq -r --arg fn "$TEST_FILE" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
-            echo "目标文件 FID: $TARGET_FID"
-          fi
-
-          if [ -z "$TARGET_FID" ]; then
-            echo "❌ 未能在网盘中匹配到刚刚上传的文件，可能是路径未刷新或 Cookie 权限异常"
+          if [ -z "$DIR_FID" ]; then
+            echo "❌ 未找到目录 ${TEST_DIR}，原始返回: $DIR_LIST"
             exit 1
           fi
+          echo "✅ 目录 FID: $DIR_FID"
 
-          echo "========================================================"
-          echo "🔗 正在调用夸克 PC API 创建分享..."
+          echo "🔍 2. 查找文件 ${TEST_FILE} 的 FID..."
+          FILE_LIST=$(curl -s -X GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${DIR_FID}&_size=100" \
+            -H "Cookie: $CLEAN_COOKIE" -H "User-Agent: $UA")
+          FILE_FID=$(echo "$FILE_LIST" | jq -r --arg fn "$TEST_FILE" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
 
-          # 参数：url_type=0，expired_type=3 (7天)
-          PAYLOAD=$(jq -n --arg fid "$TARGET_FID" --arg title "$TEST_FILE" '{"fid_list":[$fid],"title":$title,"url_type":0,"expired_type":3}')
+          if [ -z "$FILE_FID" ]; then
+            echo "❌ 未找到文件 ${TEST_FILE}，原始返回: $FILE_LIST"
+            exit 1
+          fi
+          echo "✅ 文件 FID: $FILE_FID"
+
+          echo "==================== 请求创建分享链接 ===================="
+          # url_type: 0 (直链/无密), expired_type: 3 (7天有效期)
+          SHARE_PAYLOAD=$(jq -n --arg fid "$FILE_FID" --arg title "$TEST_FILE" '{"fid_list":[$fid],"title":$title,"url_type":0,"expired_type":3}')
           
-          SHARE_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" \
+          STEP1_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc" \
             -H "Cookie: $CLEAN_COOKIE" \
-            -H "User-Agent: $COMMON_UA" \
+            -H "User-Agent: $UA" \
             -H "Content-Type: application/json;charset=UTF-8" \
-            -d "$PAYLOAD")
+            -d "$SHARE_PAYLOAD")
 
-          echo "夸克创建分享原始返回: $SHARE_RES"
+          echo "📦 [原始数据] 第 1 步创建返回:"
+          echo "$STEP1_RES" | jq . || echo "$STEP1_RES"
 
-          SHARE_ID=$(echo "$SHARE_RES" | jq -r '.data.task_resp.data.share_id // .data.share_id // empty' 2>/dev/null || echo "")
-          SHARE_URL=$(echo "$SHARE_RES" | jq -r '.data.task_resp.data.share_url // .data.share_url // empty' 2>/dev/null || echo "")
+          SHARE_ID=$(echo "$STEP1_RES" | jq -r '.data.task_resp.data.share_id // .data.share_id // empty' 2>/dev/null || echo "")
+          SHARE_URL=$(echo "$STEP1_RES" | jq -r '.data.task_resp.data.share_url // .data.share_url // empty' 2>/dev/null || echo "")
+          PASSCODE=""
 
-          # 如第一步未直接给出完整 share_url，调用第二步密码接口提取
-          PASSCODE="无"
-          if [ -n "$SHARE_ID" ]; then
-            PWD_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc" \
+          if [ -n "$SHARE_ID" ] && [ -z "$SHARE_URL" ]; then
+            echo "🔄 [步骤换取] share_url 为空，调用 /share/password 获取..."
+            STEP2_RES=$(curl -s -X POST "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc" \
               -H "Cookie: $CLEAN_COOKIE" \
-              -H "User-Agent: $COMMON_UA" \
+              -H "User-Agent: $UA" \
               -H "Content-Type: application/json;charset=UTF-8" \
               -d "{\"share_id\":\"$SHARE_ID\"}")
-            
-            echo "密码换取原始返回: $PWD_RES"
-            
-            PWD_URL=$(echo "$PWD_RES" | jq -r '.data.share_url // .data.url // empty' 2>/dev/null || echo "")
-            if [ -n "$PWD_URL" ]; then SHARE_URL="$PWD_URL"; fi
-            
-            FETCH_PASS=$(echo "$PWD_RES" | jq -r '.data.passcode // .data.pwd // empty' 2>/dev/null || echo "")
-            if [ -n "$FETCH_PASS" ]; then PASSCODE="$FETCH_PASS"; fi
+
+            echo "🔑 [原始数据] 第 2 步换取返回:"
+            echo "$STEP2_RES" | jq . || echo "$STEP2_RES"
+
+            SHARE_URL=$(echo "$STEP2_RES" | jq -r '.data.share_url // .data.url // empty' 2>/dev/null || echo "")
+            PASSCODE=$(echo "$STEP2_RES" | jq -r '.data.passcode // .data.pwd // "无"' 2>/dev/null || echo "无")
           fi
 
-          echo ""
-          echo "========================================================"
+          echo "=========================================================="
           if [ -n "$SHARE_URL" ]; then
-            echo "🎉 测试成功！已生成夸克分享链接："
-            echo "🔗 分享直链: $SHARE_URL"
-            echo "🔑 提取码:   $PASSCODE"
+            echo "🎉 测试成功！"
+            echo "🔗 分享链接: $SHARE_URL"
+            echo "🔑 密码/提取码: ${PASSCODE:-无}"
           else
-            echo "❌ 生成失败，请查看上方接口返回的错误内容"
+            echo "❌ 未能提取到分享链接，请根据上方打印的原始数据排查字段变化。"
+            exit 1
           fi
-          echo "========================================================"
+          echo "=========================================================="
