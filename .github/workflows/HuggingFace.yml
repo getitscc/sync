@@ -1,0 +1,191 @@
+name: HuggingFace Edge Sync Engine
+
+on:
+  repository_dispatch:
+    types: [hf_sync, download_hf]
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: 'HuggingFace 模型 ID (例: meta-llama/Llama-2-7b-hf)'
+        required: true
+        default: 'openai/clip-vit-base-patch32'
+      include_patterns:
+        description: '需下载的文件规则 (逗号分隔)'
+        required: true
+        default: '*.safetensors,*.json,*.txt,*.model,*.md'
+      task_id:
+        description: '任务追踪 ID'
+        required: false
+        default: ''
+      callback_url:
+        description: '回调通知接口'
+        required: false
+        default: ''
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 输入参数解析与命名规格化
+        id: parse
+        run: |
+          RAW_MODEL="${{ github.event.client_payload.model_id || github.event.inputs.model_id }}"
+          PATTERNS="${{ github.event.client_payload.include_patterns || github.event.inputs.include_patterns || '*.safetensors,*.json,*.txt,*.model,*.md' }}"
+          TASK_ID="${{ github.event.client_payload.task_id || github.event.inputs.task_id }}"
+          CALLBACK_URL="${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}"
+
+          if [ -z "$RAW_MODEL" ]; then exit 1; fi
+          if [ -z "$TASK_ID" ]; then TASK_ID="hf_manual_$(date +%s)"; fi
+
+          RAW_MODEL=$(echo "$RAW_MODEL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          CATEGORY_DIR=$(echo "$RAW_MODEL" | tr '/' '-')
+
+          echo "TASK_ID=$TASK_ID" >> $GITHUB_ENV
+          echo "RAW_MODEL=$RAW_MODEL" >> $GITHUB_ENV
+          echo "INCLUDE_PATTERNS=$PATTERNS" >> $GITHUB_ENV
+          echo "CATEGORY_DIR=$CATEGORY_DIR" >> $GITHUB_ENV
+          echo "CALLBACK_URL=$CALLBACK_URL" >> $GITHUB_ENV
+
+      - name: 2. 安装基础依赖与 HuggingFace 工具包
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl jq python3-pip
+          pip3 install -U huggingface_hub
+
+      - name: 3. 挂载 AList 临时容器 (获取原生 API Token)
+        env:
+          QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
+        run: |
+          if [ -z "$QUARK_COOKIE" ]; then exit 1; fi
+          
+          # 清洗 Cookie 防止换行符导致 JSON 破损
+          CLEAN_COOKIE=$(echo "$QUARK_COOKIE" | sed -e 's/^Cookie:[[:space:]]*//i' | tr -d '\r\n')
+          
+          docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null
+          until curl -s http://127.0.0.1:5244/api/public/settings > /dev/null; do sleep 1; done
+          docker exec alist_sync ./alist admin set 123456 > /dev/null
+          
+          TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login -H "Content-Type: application/json" -d '{"username": "admin", "password": "123456"}' | jq -r '.data.token')
+          echo "ALIST_TOKEN=$TOKEN" >> $GITHUB_ENV
+          
+          STORAGE_PAYLOAD=$(jq -n --arg cookie "$CLEAN_COOKIE" '{"mount_path": "/quark", "order": 0, "remark": "temp_driver", "driver": "Quark", "addition": ("{\"cookie\":\"" + $cookie + "\",\"root_folder_id\":\"0\"}")}')
+          
+          curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
+            -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
+            -d "$STORAGE_PAYLOAD" > /dev/null
+
+      - name: 4. 智能流水线：按需拉取、流式直传与即时清理
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          cat << 'EOF' > sync.py
+          import os, fnmatch, subprocess, shutil
+          from huggingface_hub import HfApi, hf_hub_download
+
+          model_id = os.environ['RAW_MODEL']
+          patterns = [p.strip() for p in os.environ['INCLUDE_PATTERNS'].split(',')]
+          token = os.environ.get('HF_TOKEN')
+          alist_token = os.environ['ALIST_TOKEN']
+          cat_dir = os.environ['CATEGORY_DIR']
+
+          print(f"🔍 正在检索 {model_id} 仓库文件清单...")
+          api = HfApi(token=token)
+          try:
+              files = api.list_repo_files(repo_id=model_id)
+          except Exception as e:
+              print(f"❌ 获取模型元数据失败: {e}")
+              exit(1)
+
+          # 按规则筛选需要下载的文件
+          matched_files = []
+          for f in files:
+              for p in patterns:
+                  if fnmatch.fnmatch(f, p):
+                      matched_files.append(f)
+                      break
+
+          print(f"🎯 命中规则，共需传输 {len(matched_files)} 个文件。")
+
+          for f in matched_files:
+              print(f"\n=============================================")
+              print(f"📥 [1/3] 正在下载文件: {f}")
+              try:
+                  # local_dir_use_symlinks=False 确保直接落盘，而非仅软链接
+                  local_path = hf_hub_download(
+                      repo_id=model_id,
+                      filename=f,
+                      local_dir="/tmp/hf_download",
+                      local_dir_use_symlinks=False,
+                      token=token
+                  )
+              except Exception as e:
+                  print(f"⚠️ 下载失败，跳过 {f}: {e}")
+                  continue
+
+              # 保持模型原有的层级目录结构
+              file_dir = os.path.dirname(f)
+              quark_dir = f"/quark/hf_models/{cat_dir}/{file_dir}".rstrip('/')
+              
+              subprocess.run([
+                  "curl", "-s", "-X", "POST", "http://127.0.0.1:5244/api/fs/mkdir",
+                  "-H", f"Authorization: {alist_token}",
+                  "-H", "Content-Type: application/json",
+                  "-d", f'{{"path": "{quark_dir}"}}'
+              ], stdout=subprocess.DEVNULL)
+
+              quark_path = f"{quark_dir}/{os.path.basename(f)}"
+              print(f"📤 [2/3] 调用原生 API 直传夸克: {quark_path}")
+              
+              res = subprocess.run([
+                  "curl", "-X", "PUT", "-#",
+                  "-H", f"Authorization: {alist_token}",
+                  "-H", f"File-Path: {quark_path}",
+                  "-H", "As-Task: false",
+                  "-T", local_path,
+                  "http://127.0.0.1:5244/api/fs/put"
+              ])
+
+              if res.returncode != 0:
+                  print(f"❌ 上传失败: {f}")
+                  exit(1)
+
+              print(f"🧹 [3/3] 上传完毕，即刻抹除本地文件与缓存释放空间...")
+              if os.path.exists(local_path):
+                  os.remove(local_path)
+              
+              # 清理 HF 隐藏缓存目录，彻底斩断空间占用
+              cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+              if os.path.exists(cache_dir):
+                  shutil.rmtree(cache_dir)
+              
+          print("\n🎉 所有模型文件同步完成！")
+          EOF
+          python3 sync.py
+
+      - name: 5. 状态回调与闭环通知
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          if [ -n "$CALLBACK_URL" ]; then
+            echo "📢 正在向调度端发起回调通知..."
+            
+            PAYLOAD=$(jq -n \
+              --arg task_id "$TASK_ID" \
+              --arg status "$JOB_STATUS" \
+              --arg folder_name "$CATEGORY_DIR" \
+              --arg model_name "$RAW_MODEL" \
+              '{
+                taskId: $task_id,
+                status: (if $status == "success" then "uploaded" else "failed" end),
+                fileName: $folder_name,
+                categoryDir: "hf_models",
+                modelName: $model_name
+              }')
+
+            curl -sS -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$PAYLOAD" || true
+          fi
