@@ -1,0 +1,356 @@
+name: File Overseas Sync Engine
+
+on:
+  repository_dispatch:
+    types: [download_file, docker_sync, download_docker]
+  workflow_dispatch:
+    inputs:
+      project_type:
+        description: '项目类型'
+        required: true
+        default: 'docker'
+        type: choice
+        options:
+          - docker
+          - huggingface
+          - other
+      source_name:
+        description: '资源名 (例如: nginx / bert-base)'
+        required: true
+        default: 'nginx'
+      version:
+        description: '版本/tag'
+        required: true
+        default: 'latest'
+      arch:
+        description: '系统架构'
+        required: true
+        default: 'amd64'
+        type: choice
+        options:
+          - amd64
+          - arm64
+          - arm
+          - 386
+          - linux/amd64
+          - linux/arm64/v8
+          - linux/arm/v7
+      task_id:
+        description: '任务追踪 ID'
+        required: false
+        default: ''
+      callback_url:
+        description: '回调通知接口'
+        required: false
+        default: ''
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 根据项目类型选对应的 Cookie Secret
+    env:
+      PROJECT_TYPE: ${{ github.event.client_payload.project_type || github.event.inputs.project_type }}
+    steps:
+      # ---------- 1. 参数解析与命名规格化 ----------
+      - name: 1. 输入参数解析与命名规格化
+        id: parse
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          PROJECT_TYPE: ${{ github.event.client_payload.project_type || github.event.inputs.project_type }}
+        run: |
+          PROJECT_TYPE="${{ github.event.client_payload.project_type || github.event.inputs.project_type || 'docker' }}"
+          SOURCE_NAME="${{ github.event.client_payload.source_name || github.event.inputs.source_name || '' }}"
+          VERSION="${{ github.event.client_payload.version || github.event.inputs.version || 'latest' }}"
+          ARCH="${{ github.event.client_payload.arch || github.event.inputs.arch || 'amd64' }}"
+          TASK_ID="${{ github.event.client_payload.task_id || github.event.inputs.task_id }}"
+          CALLBACK_URL="${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}"
+
+          if [ -z "$SOURCE_NAME" ]; then exit 1; fi
+          if [ -z "$TASK_ID" ]; then TASK_ID="manual_$(date +%s)"; fi
+          SOURCE_NAME=$(echo "$SOURCE_NAME" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+          # Docker 项目：补全 docker.io/library 前缀
+          FULL_IMAGE=""
+          if [ "$PROJECT_TYPE" = "docker" ]; then
+              CLEAN_NAME=$(echo "$SOURCE_NAME" | sed 's|^docker\.io/||' | sed 's|^library/||')
+              if [[ "$CLEAN_NAME" == *"/"* ]]; then
+                  FIRST_PART="${CLEAN_NAME%%/*}"
+                  if [[ "$FIRST_PART" == *"."* ]]; then
+                      CLEAN_NAME="${CLEAN_NAME#*/}"
+                  fi
+              fi
+              if [[ "$CLEAN_NAME" != *":"* ]]; then
+                  IMAGE_BASE="$CLEAN_NAME"
+                  TAG="$VERSION"
+              else
+                  IMAGE_BASE="${CLEAN_NAME%%:*}"
+                  TAG="${CLEAN_NAME##*:}"
+              fi
+              if [[ "$CLEAN_NAME" != *"/"* ]]; then
+                  FULL_IMAGE="docker.io/library/${CLEAN_NAME}:${TAG}"
+              elif [[ "$CLEAN_NAME" != *"."* ]] || [[ "${CLEAN_NAME%%/*}" != *"."* ]]; then
+                  FULL_IMAGE="docker.io/${CLEAN_NAME}:${TAG}"
+              else
+                  FULL_IMAGE="${CLEAN_NAME}:${TAG}"
+              fi
+          else
+              IMAGE_BASE="$SOURCE_NAME"
+              TAG="$VERSION"
+          fi
+
+          CLEAN_IMAGE_NAME=$(echo "$IMAGE_BASE" | tr '/' '-')
+          CATEGORY_DIR="${IMAGE_BASE##*/}"
+
+          SAFE_FILENAME="${CLEAN_IMAGE_NAME}_${TAG}_${ARCH}.tar"
+          LOCAL_TAR="/tmp/${SAFE_FILENAME}"
+          DIGEST=""
+
+          echo "PROJECT_TYPE=$PROJECT_TYPE" >> $GITHUB_ENV
+          echo "SOURCE_NAME=$SOURCE_NAME" >> $GITHUB_ENV
+          echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_ENV
+          echo "ARCH=$ARCH" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "IMAGE_BASE=$IMAGE_BASE" >> $GITHUB_ENV
+          echo "SAFE_FILENAME=$SAFE_FILENAME" >> $GITHUB_ENV
+          echo "CATEGORY_DIR=$CATEGORY_DIR" >> $GITHUB_ENV
+          echo "LOCAL_TAR=$LOCAL_TAR" >> $GITHUB_ENV
+          echo "CALLBACK_URL=$CALLBACK_URL" >> $GITHUB_ENV
+          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
+
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"prepared\",\"message\":\"参数解析完成\",\"projectType\":\"$PROJECT_TYPE\"}" || true
+          fi
+
+      # ---------- 2. 安装工具链 ----------
+      - name: 2. 安装必要运行工具链
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo curl jq pigz
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"prepared\",\"message\":\"工具链就绪\",\"projectType\":\"$PROJECT_TYPE\"}" || true
+          fi
+
+      # ---------- 3. 磁盘空间预估 ----------
+      - name: 3. 智能预估镜像大小与按需清理磁盘
+        run: |
+          FREE_SPACE_MB=$(df -m / | awk 'NR==2 {print $4}')
+
+          if [ "$PROJECT_TYPE" = "docker" ]; then
+              echo "🔍 正在向 Registry 获取镜像 Manifest..."
+              RAW_MANIFEST=$(skopeo inspect --raw "docker://${FULL_IMAGE}" || echo "{}")
+              COMPRESSED_SIZE=$(echo "$RAW_MANIFEST" | jq -r '[.layers[].size] | add // 0' 2>/dev/null || echo 0)
+              ESTIMATED_MB=$(( COMPRESSED_SIZE * 3 / 1024 / 1024 ))
+              COMPRESSED_MB=$(( COMPRESSED_SIZE / 1024 / 1024 ))
+              echo "📦 压缩流预估: ~ ${COMPRESSED_MB} MB | 预估 Tar: ~ ${ESTIMATED_MB} MB | 可用: ${FREE_SPACE_MB} MB"
+          else
+              ESTIMATED_MB=5120   # 非 Docker 默认预估 5GB
+              echo "📦 非 Docker 项目，默认预估 5GB 空间"
+          fi
+
+          if [ "$ESTIMATED_MB" -ge 10240 ] || [ $((FREE_SPACE_MB - ESTIMATED_MB)) -lt 5120 ]; then
+            echo "⚠️ 磁盘缓冲不足，执行深度清理..."
+            echo "📉 清理前: $(df -h / | awk 'NR==2 {print $4}')"
+            sudo rm -rf /usr/share/dotnet
+            sudo rm -rf /usr/local/lib/android
+            sudo rm -rf /opt/ghc
+            sudo rm -rf /opt/hostedtoolcache/CodeQL
+            sudo rm -rf /usr/local/share/boost
+            sudo rm -rf /usr/local/share/powershell
+            sudo rm -rf /usr/share/swift
+            sudo docker image prune --all --force > /dev/null 2>&1 || true
+            sudo apt-get clean
+            echo "📈 清理后: $(df -h / | awk 'NR==2 {print $4}')"
+          else
+            echo "🚀 空间充足，直通下载"
+          fi
+
+      # ---------- 4. 挂载 AList + 注入对应项目的 Cookie ----------
+      - name: 4. 挂载 AList 临时容器
+        env:
+          # 根据 project_type 从 GitHub Secret 选 Cookie
+          QUARK_COOKIE_DOCKER: ${{ secrets.QUARK_COOKIE_DOCKER }}
+          QUARK_COOKIE_HF: ${{ secrets.QUARK_COOKIE_HF }}
+          QUARK_COOKIE_OTHER: ${{ secrets.QUARK_COOKIE_OTHER }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          # 按项目类型选 Cookie
+          case "$PROJECT_TYPE" in
+            docker)      QUARK_COOKIE="${QUARK_COOKIE_DOCKER}" ;;
+            huggingface) QUARK_COOKIE="${QUARK_COOKIE_HF}" ;;
+            *)           QUARK_COOKIE="${QUARK_COOKIE_OTHER}" ;;
+          esac
+
+          if [ -z "$QUARK_COOKIE" ]; then
+            echo "❌ 缺少项目 ${PROJECT_TYPE} 对应的 QUARK_COOKIE Secret"
+            exit 1
+          fi
+
+          CLEAN_COOKIE=$(echo "$QUARK_COOKIE" | sed -e 's/^Cookie:[[:space:]]*//i' | tr -d '\r\n')
+          echo "QUARK_COOKIE=$QUARK_COOKIE" >> $GITHUB_ENV
+          echo "CLEAN_COOKIE=$CLEAN_COOKIE" >> $GITHUB_ENV
+
+          # 确定网盘根目录
+          case "$PROJECT_TYPE" in
+            docker)      ROOT_FOLDER="/docker_images" ;;
+            huggingface) ROOT_FOLDER="/huggingface_models" ;;
+            *)           ROOT_FOLDER="/misc" ;;
+          esac
+          echo "ROOT_FOLDER=$ROOT_FOLDER" >> $GITHUB_ENV
+
+          docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null
+          until curl -s http://127.0.0.1:5244/api/public/settings > /dev/null; do sleep 1; done
+          docker exec alist_sync ./alist admin set 123456 > /dev/null
+
+          TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"username": "admin", "password": "123456"}' | jq -r '.data.token' 2>/dev/null)
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" == "null" ]; then
+            echo "❌ AList 获取 Token 失败!"
+            curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"status\":\"failed\",\"error\":\"AList 核心服务异常\"}" || true
+            exit 1
+          fi
+          echo "ALIST_TOKEN=$TOKEN" >> $GITHUB_ENV
+
+          MOUNT_RES=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
+            -H "Authorization: $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg cookie "$CLEAN_COOKIE" '{
+              mount_path: "/quark", order: 0, remark: "temp_driver",
+              driver: "Quark",
+              addition: ({cookie: $cookie, root_folder_id: "0"} | tojson)
+            }')")
+
+          MOUNT_CODE=$(echo "$MOUNT_RES" | jq -r '.code // 500' 2>/dev/null)
+          if [ "$MOUNT_CODE" != "200" ]; then
+             ERR_MSG=$(echo "$MOUNT_RES" | jq -r '.message // "未知"' 2>/dev/null)
+             curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
+               -H "X-Callback-Secret: $CALLBACK_SECRET" \
+               -d "{\"taskId\":\"$TASK_ID\",\"status\":\"failed\",\"error\":\"夸克网盘挂载失败: $ERR_MSG\"}" || true
+             exit 1
+          fi
+
+      # ---------- 5. 拉取 + 压缩 + 上传 ----------
+      - name: 5. 拉取、压缩与大文件直传
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          # ---- Docker 项目：用 skopeo 拉取 ----
+          if [ "$PROJECT_TYPE" = "docker" ]; then
+            if [ -n "$CALLBACK_URL" ]; then
+              curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
+                -H "X-Callback-Secret: $CALLBACK_SECRET" \
+                -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在拉取镜像...\",\"projectType\":\"$PROJECT_TYPE\"}" || true
+            fi
+
+            echo "📥 [Docker] 拉取镜像..."
+            if ! PULL_ERROR=$(skopeo copy --override-os linux --override-arch "$ARCH" \
+                "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}" 2>&1); then
+              echo "❌ 镜像拉取失败: $PULL_ERROR"
+              curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
+                -H "X-Callback-Secret: $CALLBACK_SECRET" \
+                -d "{\"taskId\":\"$TASK_ID\",\"status\":\"failed\",\"error\":\"镜像拉取失败: $PULL_ERROR\",\"projectType\":\"$PROJECT_TYPE\"}" || true
+              exit 1
+            fi
+
+            echo "🗜️ 启动 pigz 压缩..."
+            pigz -9 -p 4 "$LOCAL_TAR"
+            mv "${LOCAL_TAR}.gz" "$LOCAL_TAR"
+
+            DIGEST="$(skopeo inspect --format '{{.Digest}}' "docker://$FULL_IMAGE" 2>/dev/null || echo "")"
+            echo "DIGEST=$DIGEST" >> $GITHUB_ENV
+          else
+            # 非 Docker 项目：用户应该已经把文件准备好了
+            # 这里预留：支持从 HuggingFace / GitHub Release 等下载
+            echo "📥 非 Docker 项目，需扩展下载逻辑（当前示例直接创建空文件）"
+            touch "$LOCAL_TAR"
+          fi
+
+          FILE_SIZE=$(stat -c%s "$LOCAL_TAR")
+          FILE_SIZE_MB=$(( FILE_SIZE / 1024 / 1024 ))
+          echo "✅ 准备完成，大小: ${FILE_SIZE_MB} MB"
+
+          # ---- 创建目录 ----
+          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"path\": \"/quark${ROOT_FOLDER}/${CATEGORY_DIR}\"}" > /dev/null
+
+          # latest 版本覆盖旧文件
+          if [ "$TAG" = "latest" ]; then
+            curl -s -X POST http://127.0.0.1:5244/api/fs/remove \
+              -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+              -d "{\"dir\": \"/quark${ROOT_FOLDER}/${CATEGORY_DIR}\", \"names\": [\"${SAFE_FILENAME}\"]}" > /dev/null
+          fi
+
+          # ---- 上传 ----
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"uploading\",\"message\":\"正在直传夸克网盘...\",\"projectType\":\"$PROJECT_TYPE\"}" || true
+          fi
+
+          curl -X PUT -# -H "Authorization: $ALIST_TOKEN" \
+            -H "File-Path: /quark${ROOT_FOLDER}/${CATEGORY_DIR}/${SAFE_FILENAME}" \
+            -H "As-Task: false" \
+            -T "$LOCAL_TAR" \
+            "http://127.0.0.1:5244/api/fs/put" | tee upload_res.json
+
+          UPLOAD_CODE=$(jq -r '.code // 500' upload_res.json 2>/dev/null || echo "500")
+          if [ "$UPLOAD_CODE" != "200" ]; then
+             ERR_MSG=$(jq -r '.message // "未知"' upload_res.json 2>/dev/null)
+             curl -sS -X POST "$CALLBACK_URL" -H "Content-Type: application/json" \
+               -H "X-Callback-Secret: $CALLBACK_SECRET" \
+               -d "{\"taskId\":\"$TASK_ID\",\"status\":\"failed\",\"error\":\"上传失败: $ERR_MSG\",\"projectType\":\"$PROJECT_TYPE\"}" || true
+             exit 1
+          fi
+
+          # ---- 拿到刚上传文件的 fid（夸克网盘的文件 ID）----
+          echo "🔍 正在获取网盘文件 fid..."
+          LIST_RES=$(curl -s -X POST http://127.0.0.1:5244/api/fs/list \
+            -H "Authorization: $ALIST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"path\": \"/quark${ROOT_FOLDER}/${CATEGORY_DIR}\", \"page\": 1, \"per_page\": 50}")
+
+          DRIVE_FID=$(echo "$LIST_RES" | jq -r --arg fn "$SAFE_FILENAME" \
+            '.data.content[] | select(.name == $fn) | (.provider_id // .id // .fid // .raw.id) | select(. != null)' \
+            2>/dev/null | head -n 1)
+
+          echo "DRIVE_FID=$DRIVE_FID" >> $GITHUB_ENV
+          echo "🔑 文件 fid: $DRIVE_FID"
+
+          # ---- 回调 Worker：上传完成（带 cookie 让 Worker 自动同步到 D1）----
+          PAYLOAD=$(jq -n \
+            --arg taskId "$TASK_ID" \
+            --arg status "uploaded" \
+            --arg projectType "$PROJECT_TYPE" \
+            --arg sourceName "$IMAGE_BASE" \
+            --arg version "$TAG" \
+            --arg arch "$ARCH" \
+            --arg digest "$DIGEST" \
+            --arg driveFid "$DRIVE_FID" \
+            --arg cookie "$QUARK_COOKIE" \
+            '{
+              taskId: $taskId, status: $status,
+              projectType: $projectType,
+              sourceName: $sourceName, version: $version, arch: $arch,
+              digest: $digest, driveFid: $driveFid,
+              cookie: $cookie
+            }')
+
+          curl -sS -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CALLBACK_SECRET" \
+            -d "$PAYLOAD" || true
+
+          rm -f "$LOCAL_TAR" upload_res.json
+          echo "✅ 工作流完成，等待青龙生成 7 天临时链接"
