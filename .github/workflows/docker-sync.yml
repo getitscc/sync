@@ -4,9 +4,11 @@ name: Mirror Sync Engine (Docker / HuggingFace)
 #   1) 网盘 Cookie 不再放在 GitHub Secrets / 仓库变量里，任何位置都不落地。
 #      Cookie 只以 AES-GCM 密文保存在服务器 SQLite 的 drive_profiles 表，
 #      Actions 执行任务时凭 CALLBACK_SECRET 向 /api/drive/credential 临时领取，
-#      仅存活在本步骤的内存与 $GITHUB_ENV 中（已 ::add-mask:: 屏蔽日志），用完即弃。
+#      只存活在本步骤的内存里（已 ::add-mask:: 屏蔽日志），用完即弃。
 #   2) 回调后端时不再回传 Cookie。
-#   3) 上传归属仍在 Actions（跨境拉取后直传网盘），服务器只负责发链。
+#   3) Actions 只做「拉镜像 → 压缩 → 直传网盘 → 回调带 drive_fid」，
+#      **不建分享链接**；建链由国内设备脚本 device/device_agent.py 完成。
+#      三者（Actions / server / device）互不 import，只通过 HTTP 接口通信。
 
 on:
   repository_dispatch:
@@ -420,4 +422,4 @@ jobs:
             -d "$PAYLOAD" || true
 
           rm -f "$LOCAL_TAR" upload_res.json
-          echo "✅ 工作流完成，等待服务端生成分享链接"
+          echo "✅ 工作流完成，等待国内设备生成分享链接"
