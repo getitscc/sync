@@ -1,4 +1,4 @@
-name: Mirror Sync Engine (Docker / HuggingFace)
+name: Mirror Sync Engine (Docker)
 
 # 说明：
 #   1) 网盘 Cookie 不再放在 GitHub Secrets / 仓库变量里，任何位置都不落地。
