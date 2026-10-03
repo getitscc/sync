@@ -1,0 +1,289 @@
+name: Docker Sync
+
+# 由后端 repository_dispatch 触发（event_type=download_docker），也可手动运行。
+# 本文件自包含：拉取 → 打包 → 领凭证 → 挂网盘 → 上传 → 回调，不依赖其它自定义 Action。
+
+on:
+  repository_dispatch:
+    types: [download_docker]
+  workflow_dispatch:
+    inputs:
+      source_name:
+        description: '镜像名（可带 registry，如 ghcr.io/owner/repo）'
+        required: true
+        default: 'nginx'
+      version:
+        description: '版本 / tag（留空默认 latest）'
+        required: false
+        default: ''
+      arch:
+        description: '架构（linux/amd64、linux/arm/v7 或裸 amd64）'
+        required: false
+        default: 'linux/amd64'
+      profile_id:
+        description: '网盘账号 ID'
+        required: false
+        default: ''
+      task_id:
+        description: '任务 ID'
+        required: false
+        default: ''
+      callback_url:
+        description: '后端回调地址'
+        required: false
+        default: ''
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 参数解析与镜像引用拼装
+        id: params
+        env:
+          IN_SOURCE: ${{ github.event.client_payload.source_name || github.event.inputs.source_name }}
+          IN_VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
+          IN_ARCH: ${{ github.event.client_payload.arch || github.event.inputs.arch || 'linux/amd64' }}
+          IN_PROFILE: ${{ github.event.client_payload.profile_id || github.event.inputs.profile_id }}
+          IN_TASK: ${{ github.event.client_payload.task_id || github.event.inputs.task_id }}
+          IN_CALLBACK: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
+        run: |
+          set -euo pipefail
+          SOURCE="$IN_SOURCE"; VERSION="$IN_VERSION"; ARCH="$IN_ARCH"
+          [ -n "$SOURCE" ] || { echo "::error::缺少 source_name"; exit 1; }
+          VERSION=$(printf '%s' "$VERSION" | tr -d '\r' | xargs || true)
+          SOURCE=$(printf '%s' "$SOURCE" | tr -d '\r' | xargs)
+
+          # 镜像名里可能自带 :tag
+          if [ -z "$VERSION" ] && [[ "$SOURCE" == *:* ]]; then
+            VERSION="${SOURCE##*:}"; SOURCE="${SOURCE%%:*}"
+          fi
+          [ -n "$VERSION" ] || VERSION="latest"
+
+          # 带 registry 前缀（首段含点）就用原样，否则补 docker.io
+          if [[ "$SOURCE" == *"/"* ]] && [[ "${SOURCE%%/*}" == *.* ]]; then
+            FULL_REPO="$SOURCE"
+          elif [[ "$SOURCE" == *"/"* ]]; then
+            FULL_REPO="docker.io/$SOURCE"
+          else
+            FULL_REPO="docker.io/library/$SOURCE"
+          fi
+          FULL_IMAGE="${FULL_REPO}:${VERSION}"
+
+          # 架构拆 os/arch/variant（skopeo 要分开传）
+          if [[ "$ARCH" == *"/"* ]]; then ARCH_OS="${ARCH%%/*}"; ARCH_REST="${ARCH#*/}"; else ARCH_OS="linux"; ARCH_REST="$ARCH"; fi
+          ARCH_NAME="${ARCH_REST%%/*}"; ARCH_VARIANT=""
+          [[ "$ARCH_REST" == */* ]] && ARCH_VARIANT="${ARCH_REST#*/}"
+          ARCH_SAFE="${ARCH//\//-}"
+
+          CATEGORY_DIR="${SOURCE##*/}"
+          SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
+          PAN_FILE_NAME="${SAFE_NAME}_${VERSION}_${ARCH_SAFE}.tar.gz"
+
+          {
+            echo "SOURCE=$SOURCE"
+            echo "VERSION=$VERSION"
+            echo "ARCH=$ARCH"
+            echo "FULL_IMAGE=$FULL_IMAGE"
+            echo "ARCH_OS=$ARCH_OS"
+            echo "ARCH_NAME=$ARCH_NAME"
+            echo "ARCH_VARIANT=$ARCH_VARIANT"
+            echo "CATEGORY_DIR=$CATEGORY_DIR"
+            echo "PAN_FILE_NAME=$PAN_FILE_NAME"
+            echo "PROFILE_ID=${IN_PROFILE:-docker_quark}"
+            echo "TASK_ID=${IN_TASK:-manual_$(date +%s)}"
+            echo "CALLBACK_URL=$IN_CALLBACK"
+          } >> "$GITHUB_ENV"
+          echo "📋 $FULL_IMAGE | $ARCH"
+
+      - name: 2. 安装工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo curl jq pigz
+
+      - name: 3. 磁盘按需清理
+        run: |
+          set -euo pipefail
+          RAW=$(skopeo inspect --raw "docker://${FULL_IMAGE}" || echo '{}')
+          SIZE=$(echo "$RAW" | jq -r '[.layers[].size] | add // 0' 2>/dev/null || echo 0)
+          EST_MB=$(( SIZE * 3 / 1024 / 1024 ))
+          FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
+          echo "预估 tar: ~${EST_MB}MB | 可用: ${FREE_MB}MB"
+          if [ "$EST_MB" -ge 10240 ] || [ $((FREE_MB - EST_MB)) -lt 5120 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                        /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                        /usr/local/share/powershell /usr/share/swift
+            sudo apt-get clean
+          fi
+
+      - name: 4. 拉取并压缩
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 各 registry 的登录（都配了才登；公开镜像不需要）
+          if [[ "$FULL_IMAGE" == ghcr.io/* ]] && [ -n "${GHCR_TOKEN:-}" ]; then
+            echo "$GHCR_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          fi
+          if [[ "$FULL_IMAGE" == nvcr.io/* ]] && [ -n "${NGC_API_KEY:-}" ]; then
+            echo "$NGC_API_KEY" | skopeo login nvcr.io -u '$oauthtoken' --password-stdin
+          fi
+          if [[ "$FULL_IMAGE" == docker.io/* ]] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "$DOCKERHUB_TOKEN" | skopeo login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
+          fi
+
+          PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
+          [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
+
+          LOCAL_TAR="/tmp/${PAN_FILE_NAME%.gz}"
+          skopeo copy "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
+          pigz -9 -p 4 "$LOCAL_TAR"
+
+          # 平台 manifest digest：必须带同样的 override，否则拿到的是宿主机架构的 digest，
+          # 与服务端 platform_digest 对不上，会被误判成「源已更新」而反复重拉
+          DIGEST=$(skopeo inspect "${PLATFORM[@]}" --format '{{.Digest}}' "docker://${FULL_IMAGE}")
+          SIZE_BYTES=$(stat -c%s "/tmp/${PAN_FILE_NAME}")
+          {
+            echo "LOCAL_FILE=/tmp/${PAN_FILE_NAME}"
+            echo "CHECKSUM_VALUE=$DIGEST"
+            echo "SIZE_BYTES=$SIZE_BYTES"
+          } >> "$GITHUB_ENV"
+          echo "digest=$DIGEST size=${SIZE_BYTES}B"
+
+      - name: 5. 领取网盘凭证
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          CRED_URL="${CALLBACK_URL%/callback}/drive/credential?profile_id=${PROFILE_ID}"
+          CRED=$(curl -sS -f "$CRED_URL" -H "X-Callback-Secret: $CALLBACK_SECRET")
+          DRIVE_TYPE=$(echo "$CRED" | jq -r '.data.drive_type // empty')
+          COOKIE=$(echo "$CRED" | jq -r '.data.cookie // empty')
+          ROOT_FOLDER=$(echo "$CRED" | jq -r '.data.root_folder // empty')
+          ALIST_DRIVER=$(echo "$CRED" | jq -r '.data.alist_driver // empty')
+          if [ -z "$COOKIE" ]; then
+            echo "::error::领取网盘凭证失败：$(echo "$CRED" | jq -r '.message // "响应为空"')"
+            exit 1
+          fi
+          # 单行形式也遮一遍（多行 Cookie 的逐行遮罩由平台的 secret 机制兜底）
+          echo "::add-mask::$(printf '%s' "$COOKIE" | tr -d '\r\n')"
+          {
+            echo "DRIVE_TYPE=$DRIVE_TYPE"
+            echo "ROOT_FOLDER=$ROOT_FOLDER"
+            echo "ALIST_DRIVER=$ALIST_DRIVER"
+            echo "COOKIE<<__COOKIE_EOF__"
+            printf '%s\n' "$COOKIE"
+            echo "__COOKIE_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: 6. 启动 AList 并挂载网盘
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null
+          for _ in $(seq 1 60); do
+            curl -s http://127.0.0.1:5244/api/public/settings > /dev/null && break
+            sleep 1
+          done
+          docker exec alist_sync ./alist admin set 123456 > /dev/null
+          TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"123456"}' | jq -r '.data.token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::AList 登录失败"
+            exit 1
+          fi
+          echo "ALIST_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          # 各网盘的 addition 结构不同，按 driver 组装（只传 cookie，其余字段交给驱动默认值）
+          case "$ALIST_DRIVER" in
+            Quark)        ADDITION=$(jq -n --arg c "$COOKIE" '{cookie:$c, root_folder_id:"0"}') ;;
+            BaiduNetdisk) ADDITION=$(jq -n --arg c "$COOKIE" '{cookie:$c, root_folder:"/"}') ;;
+            *)            ADDITION=$(jq -n --arg c "$COOKIE" '{cookie:$c}') ;;
+          esac
+
+          MOUNT=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
+            -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg mp "/pan" --arg d "$ALIST_DRIVER" --arg a "$ADDITION" \
+                  '{mount_path:$mp, order:0, remark:"temp", driver:$d, addition:$a}')")
+          CODE=$(echo "$MOUNT" | jq -r '.code // 500')
+          if [ "$CODE" != "200" ]; then
+            echo "::error::网盘挂载失败（$ALIST_DRIVER）：$(echo "$MOUNT" | jq -r '.message // "未知"')"
+            exit 1
+          fi
+
+      - name: 7. 上传并取文件 ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST_DIR="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
+          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p}')" > /dev/null
+
+          # 移动标签（latest/stable/main）指向的内容会变：先删旧文件，避免同名冲突
+          case "$VERSION" in
+            latest|stable|main)
+              curl -s -X POST http://127.0.0.1:5244/api/fs/remove \
+                -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+                -d "$(jq -n --arg d "$DEST_DIR" --arg n "$PAN_FILE_NAME" '{dir:$d, names:[$n]}')" > /dev/null
+              ;;
+          esac
+
+          echo "📤 上传中：$PAN_FILE_NAME"
+          curl -sS -X PUT \
+            -H "Authorization: $ALIST_TOKEN" \
+            -H "File-Path: ${DEST_DIR}/${PAN_FILE_NAME}" \
+            -H "As-Task: false" \
+            -T "$LOCAL_FILE" \
+            "http://127.0.0.1:5244/api/fs/put" > upload_res.json
+          UPLOAD_CODE=$(jq -r '.code // 500' upload_res.json)
+          if [ "$UPLOAD_CODE" != "200" ]; then
+            echo "::error::上传失败：$(jq -r '.message // "未知"' upload_res.json)"
+            exit 1
+          fi
+
+          LIST=$(curl -s -X POST http://127.0.0.1:5244/api/fs/list \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p, page:1, per_page:50}')")
+          FID=$(echo "$LIST" | jq -r --arg fn "$PAN_FILE_NAME" \
+            '.data.content[] | select(.name == $fn) | (.provider_id // .id // .fid // .raw.id) | select(. != null)' | head -n 1)
+          echo "🔑 文件 ID: ${FID:-（未取到）}"
+          {
+            echo "DRIVE_FID=$FID"
+            echo "PAN_PATH=${ROOT_FOLDER}/${CATEGORY_DIR}/${PAN_FILE_NAME}"
+          } >> "$GITHUB_ENV"
+
+      - name: 8. 回调后端（上传完成）
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          PAYLOAD=$(jq -n \
+            --arg taskId "$TASK_ID" \
+            --arg projectType "docker" \
+            --arg sourceName "$SOURCE" \
+            --arg version "$VERSION" \
+            --arg arch "${ARCH:-}" \
+            --arg checksumAlgo "docker-manifest-digest" \
+            --arg checksumValue "$CHECKSUM_VALUE" \
+            --arg packFormat "tar.gz" \
+            --argjson sizeBytes "${SIZE_BYTES:-0}" \
+            --arg driveFid "${DRIVE_FID:-}" \
+            --arg panPath "${PAN_PATH:-}" \
+            --arg panFileName "$PAN_FILE_NAME" \
+            --arg driveType "${DRIVE_TYPE:-}" \
+            '{taskId:$taskId, status:"uploaded", projectType:$projectType,
+              sourceName:$sourceName, version:$version, arch:$arch,
+              checksumAlgo:$checksumAlgo, checksumValue:$checksumValue,
+              packFormat:$packFormat, sizeBytes:$sizeBytes,
+              driveFid:$driveFid, panPath:$panPath, panFileName:$panFileName,
+              driveType:$driveType}')
+          curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CALLBACK_SECRET" \
+            -d "$PAYLOAD" || true
