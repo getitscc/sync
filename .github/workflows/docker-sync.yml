@@ -40,6 +40,7 @@ jobs:
       - name: 1. 参数解析与镜像引用拼装
         id: params
         env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
           IN_SOURCE: ${{ github.event.client_payload.source_name || github.event.inputs.source_name }}
           IN_VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
           IN_ARCH: ${{ github.event.client_payload.arch || github.event.inputs.arch || 'linux/amd64' }}
@@ -79,6 +80,11 @@ jobs:
           SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
           PAN_FILE_NAME="${SAFE_NAME}_${VERSION}_${ARCH_SAFE}.tar.gz"
 
+          # 本步骤内也要用到，所以先落成 shell 变量（写进 GITHUB_ENV 只对后续步骤生效）
+          TASK_ID="${IN_TASK:-manual_$(date +%s)}"
+          CALLBACK_URL="$IN_CALLBACK"
+          PROFILE_ID="${IN_PROFILE:-docker_quark}"
+
           {
             echo "SOURCE=$SOURCE"
             echo "VERSION=$VERSION"
@@ -89,11 +95,19 @@ jobs:
             echo "ARCH_VARIANT=$ARCH_VARIANT"
             echo "CATEGORY_DIR=$CATEGORY_DIR"
             echo "PAN_FILE_NAME=$PAN_FILE_NAME"
-            echo "PROFILE_ID=${IN_PROFILE:-docker_quark}"
-            echo "TASK_ID=${IN_TASK:-manual_$(date +%s)}"
-            echo "CALLBACK_URL=$IN_CALLBACK"
+            echo "PROFILE_ID=$PROFILE_ID"
+            echo "TASK_ID=$TASK_ID"
+            echo "CALLBACK_URL=$CALLBACK_URL"
           } >> "$GITHUB_ENV"
           echo "📋 $FULL_IMAGE | $ARCH"
+
+          # 阶段回调：已就绪（此时 jq 尚未安装，用字符串拼 JSON）
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"prepared\",\"message\":\"参数解析完成，准备拉取\",\"projectType\":\"docker\"}" || true
+          fi
 
       - name: 2. 安装工具链
         run: |
@@ -117,12 +131,21 @@ jobs:
 
       - name: 4. 拉取并压缩
         env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
           NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # 阶段回调：开始拉取
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在跨海拉取并压缩镜像…\",\"projectType\":\"docker\"}" || true
+          fi
+
           # 各 registry 的登录（都配了才登；公开镜像不需要）
           if [[ "$FULL_IMAGE" == ghcr.io/* ]] && [ -n "${GHCR_TOKEN:-}" ]; then
             echo "$GHCR_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -141,9 +164,27 @@ jobs:
           skopeo copy "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
           pigz -9 -p 4 "$LOCAL_TAR"
 
-          # 平台 manifest digest：必须带同样的 override，否则拿到的是宿主机架构的 digest，
-          # 与服务端 platform_digest 对不上，会被误判成「源已更新」而反复重拉
-          DIGEST=$(skopeo inspect "${PLATFORM[@]}" --format '{{.Digest}}' "docker://${FULL_IMAGE}")
+          # 平台 manifest digest：必须与服务端 platform_digest 算法完全一致，否则回调时会
+          # 被判「校验值不一致」。注意 skopeo inspect 的 {{.Digest}} 在多架构镜像下返回的是
+          # 「索引(manifest list) digest」，而服务端取的是索引里对应 os/arch/variant 的
+          # 「平台 digest」——两者不同，必须按平台条目自行挑出来。
+          RAW_MANIFEST=$(skopeo inspect --raw "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
+          MEDIA_TYPE=$(echo "$RAW_MANIFEST" | jq -r '.mediaType // empty' 2>/dev/null || true)
+          DIGEST=""
+          if [ "$MEDIA_TYPE" = "application/vnd.docker.distribution.manifest.list.v2+json" ] || [ "$MEDIA_TYPE" = "application/vnd.oci.image.index.v1+json" ]; then
+            DIGEST=$(echo "$RAW_MANIFEST" | jq -r \
+              --arg os "$ARCH_OS" --arg arch "$ARCH_NAME" --arg variant "$ARCH_VARIANT" \
+              '.manifests[] | select(.platform.os == $os) | select(.platform.architecture == $arch) | select($variant == "" or (.platform.variant // "") == $variant) | .digest' \
+              2>/dev/null | head -n 1 || true)
+          fi
+          # 单架构（非索引）镜像：直接用 manifest 自身 digest
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            DIGEST=$(skopeo inspect "${PLATFORM[@]}" --format '{{.Digest}}' "docker://${FULL_IMAGE}" 2>/dev/null || echo "")
+          fi
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "::error::无法解析镜像 ${FULL_IMAGE} 在 ${ARCH} 下的 digest"
+            exit 1
+          fi
           SIZE_BYTES=$(stat -c%s "/tmp/${PAN_FILE_NAME}")
           {
             echo "LOCAL_FILE=/tmp/${PAN_FILE_NAME}"
@@ -167,6 +208,11 @@ jobs:
           if [ -z "$COOKIE" ]; then
             echo "::error::领取网盘凭证失败：$(echo "$CRED" | jq -r '.message // "响应为空"')"
             exit 1
+          fi
+
+          # 网盘目标根目录：服务器下发的 root_folder 优先；为空则回落 /docker_images
+          if [ -z "$ROOT_FOLDER" ]; then
+            ROOT_FOLDER="/docker_images"
           fi
           # 单行形式也遮一遍（多行 Cookie 的逐行遮罩由平台的 secret 机制兜底）
           echo "::add-mask::$(printf '%s' "$COOKIE" | tr -d '\r\n')"
@@ -217,6 +263,8 @@ jobs:
 
       - name: 7. 上传并取文件 ID
         shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
           DEST_DIR="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
@@ -232,6 +280,14 @@ jobs:
                 -d "$(jq -n --arg d "$DEST_DIR" --arg n "$PAN_FILE_NAME" '{dir:$d, names:[$n]}')" > /dev/null
               ;;
           esac
+
+          # 阶段回调：开始上传
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"uploading\",\"message\":\"正在直传网盘…\",\"projectType\":\"docker\"}" || true
+          fi
 
           echo "📤 上传中：$PAN_FILE_NAME"
           curl -sS -X PUT \
