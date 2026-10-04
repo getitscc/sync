@@ -1,21 +1,28 @@
 name: HuggingFace Sync
 
-# 由后端 repository_dispatch 触发（event_type=download_hf），也可手动运行。
+# 由后端 repository_dispatch 触发（event_type=download_hf / download_hf_dataset），也可手动运行。
 # 本文件自包含：列文件 → 体积评估 → 逐文件拉取 → 按体积分批上传 → 回调，不依赖其它自定义 Action。
+# 同时支持两类资源：
+#   project_type=huggingface          → 模型（/api/models 与 /{repo}/resolve）
+#   project_type=huggingface_dataset  → 数据集（/api/datasets 与 /datasets/{repo}/resolve）
 #
 # 与旧版差异：
 #   1) 不再「整仓打包成一个 tar.zst」，改为**逐文件**保留原目录结构上传到网盘；
 #   2) 分批体积**动态计算**：先读本机可用磁盘，扣掉 5GB 余量后向下取整到整 GB 作为每批上限，一批拉完再传完；
 #   3) 上传前智能评估：单个文件超过该上限时，走**流式直传**（不落盘）；
-#   4) 收尾取**模型目录的 fid** 回调，设备端分享该目录 → 一个链接覆盖整个模型仓库。
+#   4) 收尾取**资源目录的 fid** 回调，设备端分享该目录 → 一个链接覆盖整个仓库。
 
 on:
   repository_dispatch:
-    types: [download_hf]
+    types: [download_hf, download_hf_dataset]
   workflow_dispatch:
     inputs:
+      project_type:
+        description: '资源类型（huggingface=模型 / huggingface_dataset=数据集）'
+        required: false
+        default: 'huggingface'
       source_name:
-        description: '模型 repo_id（如 bert-base-uncased 或 Qwen/Qwen3-0.6B）'
+        description: 'repo_id（如 bert-base-uncased 或 Qwen/Qwen3-0.6B）'
         required: true
         default: 'bert-base-uncased'
       version:
@@ -41,6 +48,7 @@ jobs:
     steps:
       - name: 1. 参数解析
         env:
+          IN_PROJECT: ${{ github.event.client_payload.project_type || github.event.inputs.project_type || 'huggingface' }}
           IN_SOURCE: ${{ github.event.client_payload.source_name || github.event.inputs.source_name }}
           IN_VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
           IN_PROFILE: ${{ github.event.client_payload.profile_id || github.event.inputs.profile_id }}
@@ -48,14 +56,31 @@ jobs:
           IN_CALLBACK: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
         run: |
           set -euo pipefail
+          PROJECT_TYPE=$(printf '%s' "$IN_PROJECT" | tr -d '\r' | xargs)
           SOURCE=$(printf '%s' "$IN_SOURCE" | tr -d '\r' | xargs)
           VERSION=$(printf '%s' "$IN_VERSION" | tr -d '\r' | xargs)
           [ -n "$SOURCE" ] || { echo "::error::缺少 source_name"; exit 1; }
           [ -n "$VERSION" ] || VERSION="main"
+          [ "$PROJECT_TYPE" = "huggingface_dataset" ] || PROJECT_TYPE="huggingface"
+
+          # 数据集与模型的 API 前缀不同：模型 /api/models，数据集 /api/datasets
+          if [ "$PROJECT_TYPE" = "huggingface_dataset" ]; then
+            API_KIND="datasets"
+            RESOLVE_PREFIX="datasets"
+            DEFAULT_ROOT="/huggingface_datasets"
+          else
+            API_KIND="models"
+            RESOLVE_PREFIX=""
+            DEFAULT_ROOT="/huggingface_models"
+          fi
 
           SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
           CATEGORY_DIR="${SOURCE##*/}"
           {
+            echo "PROJECT_TYPE=$PROJECT_TYPE"
+            echo "API_KIND=$API_KIND"
+            echo "RESOLVE_PREFIX=$RESOLVE_PREFIX"
+            echo "DEFAULT_ROOT=$DEFAULT_ROOT"
             echo "SOURCE=$SOURCE"
             echo "VERSION=$VERSION"
             echo "SAFE_NAME=$SAFE_NAME"
@@ -64,7 +89,7 @@ jobs:
             echo "TASK_ID=${IN_TASK:-manual_$(date +%s)}"
             echo "CALLBACK_URL=$IN_CALLBACK"
           } >> "$GITHUB_ENV"
-          echo "📋 $SOURCE @ $VERSION"
+          echo "📋 [$PROJECT_TYPE] $SOURCE @ $VERSION"
 
       - name: 2. 安装工具链
         run: |
@@ -87,8 +112,8 @@ jobs:
           # -L 跟随仓库名大小写规范化产生的 307 重定向；-f 让 HTTP 错误直接失败而不是喂给 jq
           # 与服务端 resolveArtifact 用同一个口径：整仓 commit sha（git-sha1）
           SHA=$(curl -sS -fL "${AUTH[@]}" \
-            "https://huggingface.co/api/models/${SOURCE}/revision/${VERSION}" | jq -r '.sha // empty')
-          [ -n "$SHA" ] || { echo "::error::取 commit sha 失败（模型不存在或需要 HF_TOKEN）"; exit 1; }
+            "https://huggingface.co/api/${API_KIND}/${SOURCE}/revision/${VERSION}" | jq -r '.sha // empty')
+          [ -n "$SHA" ] || { echo "::error::取 commit sha 失败（仓库不存在或需要 HF_TOKEN）"; exit 1; }
           echo "CHECKSUM_VALUE=$SHA" >> "$GITHUB_ENV"
           echo "commit sha=$SHA"
 
@@ -101,7 +126,7 @@ jobs:
           [ -n "${HF_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $HF_TOKEN")
 
           TREE=$(curl -sS -fL "${AUTH[@]}" \
-            "https://huggingface.co/api/models/${SOURCE}/tree/${VERSION}?recursive=1")
+            "https://huggingface.co/api/${API_KIND}/${SOURCE}/tree/${VERSION}?recursive=1")
           # 只取文件，按体积升序（大文件自然成为独立的「流式批」）
           printf '%s' "$TREE" | jq -r '[.[] | select(.type=="file")] | sort_by(.size)
             | .[] | [.path, (.size // 0 | tostring)] | @tsv' > /tmp/hf_files.tsv
@@ -148,7 +173,7 @@ jobs:
             echo "::error::领取网盘凭证失败：$(echo "$CRED" | jq -r '.message // "响应为空"')"
             exit 1
           fi
-          [ -n "$ROOT_FOLDER" ] || ROOT_FOLDER="/huggingface_models"
+          [ -n "$ROOT_FOLDER" ] || ROOT_FOLDER="${DEFAULT_ROOT:-/huggingface_models}"
           # 单行形式也遮一遍（多行 Cookie 的逐行遮罩由平台的 secret 机制兜底）
           echo "::add-mask::$(printf '%s' "$COOKIE" | tr -d '\r\n')"
           {
@@ -199,7 +224,11 @@ jobs:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
-          RESOLVE="https://huggingface.co/${SOURCE}/resolve/${VERSION}"
+          if [ -n "${RESOLVE_PREFIX:-}" ]; then
+            RESOLVE="https://huggingface.co/${RESOLVE_PREFIX}/${SOURCE}/resolve/${VERSION}"
+          else
+            RESOLVE="https://huggingface.co/${SOURCE}/resolve/${VERSION}"
+          fi
           ROOT_ON_PAN="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
           STAGE_LIMIT_BYTES=$(( STAGE_LIMIT_MB * 1024 * 1024 ))
           AUTH=()
@@ -320,7 +349,7 @@ jobs:
           set -euo pipefail
           PAYLOAD=$(jq -n \
             --arg taskId "$TASK_ID" \
-            --arg projectType "huggingface" \
+            --arg projectType "$PROJECT_TYPE" \
             --arg sourceName "$SOURCE" \
             --arg version "$VERSION" \
             --arg arch "" \

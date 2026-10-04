@@ -1,0 +1,311 @@
+name: GitHub Release Sync
+
+# 由后端 repository_dispatch 触发（event_type=download_github_release），也可手动运行。
+# 本文件自包含：解析 Release → 下载指定资产 → 领凭证 → 挂网盘 → 上传 → 回调，不依赖其它自定义 Action。
+# 一次只拉取用户选中的「单个资产（asset）」，version=tag，asset 由前端 /api/architectures 探测得到。
+
+on:
+  repository_dispatch:
+    types: [download_github_release]
+  workflow_dispatch:
+    inputs:
+      project_type:
+        description: '资源类型（固定 github_release）'
+        required: false
+        default: 'github_release'
+      source_name:
+        description: '仓库（owner/repo，如 ollama/ollama）'
+        required: true
+        default: 'ollama/ollama'
+      version:
+        description: 'Release tag（留空默认最新 Release）'
+        required: false
+        default: ''
+      asset:
+        description: '要下载的资产名（含大小写，如 ollama-linux-amd64）'
+        required: true
+        default: ''
+      profile_id:
+        description: '网盘账号 ID'
+        required: false
+        default: ''
+      task_id:
+        description: '任务 ID'
+        required: false
+        default: ''
+      callback_url:
+        description: '后端回调地址'
+        required: false
+        default: ''
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 参数解析
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          IN_SOURCE: ${{ github.event.client_payload.source_name || github.event.inputs.source_name }}
+          IN_VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
+          IN_ASSET: ${{ github.event.client_payload.asset || github.event.client_payload.arch || github.event.inputs.asset }}
+          IN_PROFILE: ${{ github.event.client_payload.profile_id || github.event.inputs.profile_id }}
+          IN_TASK: ${{ github.event.client_payload.task_id || github.event.inputs.task_id }}
+          IN_CALLBACK: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
+        run: |
+          set -euo pipefail
+          SOURCE=$(printf '%s' "$IN_SOURCE" | tr -d '\r' | xargs)
+          VERSION=$(printf '%s' "$IN_VERSION" | tr -d '\r' | xargs)
+          ASSET=$(printf '%s' "$IN_ASSET" | tr -d '\r' | xargs)
+          [ -n "$SOURCE" ] || { echo "::error::缺少 source_name"; exit 1; }
+          [ -n "$ASSET" ] || { echo "::error::缺少 asset（要下载的资产名）"; exit 1; }
+
+          CATEGORY_DIR="${SOURCE##*/}"
+          SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
+          PAN_FILE_NAME="$ASSET"
+
+          {
+            echo "SOURCE=$SOURCE"
+            echo "VERSION=$VERSION"
+            echo "ASSET=$ASSET"
+            echo "CATEGORY_DIR=$CATEGORY_DIR"
+            echo "SAFE_NAME=$SAFE_NAME"
+            echo "PAN_FILE_NAME=$PAN_FILE_NAME"
+            echo "DEFAULT_ROOT=/github_releases"
+            echo "PROFILE_ID=${IN_PROFILE:-gh_release_baidu}"
+            echo "TASK_ID=${IN_TASK:-manual_$(date +%s)}"
+            echo "CALLBACK_URL=$IN_CALLBACK"
+          } >> "$GITHUB_ENV"
+          echo "📋 $SOURCE @ ${VERSION:-latest} → $ASSET"
+
+          if [ -n "$IN_CALLBACK" ]; then
+            curl -sS -o /dev/null -f -X POST "$IN_CALLBACK" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"${IN_TASK:-manual}\",\"stage\":\"prepared\",\"message\":\"参数解析完成，准备拉取\",\"projectType\":\"github_release\"}" || true
+          fi
+
+      - name: 2. 安装工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl jq
+
+      - name: 3. 解析 Release 并定位资产
+        shell: bash
+        env:
+          GH_API_TOKEN: ${{ secrets.GH_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          AUTH=()
+          [ -n "${GH_API_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $GH_API_TOKEN")
+          GH_HEADERS=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" -H "User-Agent: getits-mirror-action")
+
+          if [ -z "$VERSION" ]; then
+            REL=$(curl -sS -fL "${AUTH[@]}" "${GH_HEADERS[@]}" "https://api.github.com/repos/${SOURCE}/releases/latest")
+          else
+            REL=$(curl -sS -fL "${AUTH[@]}" "${GH_HEADERS[@]}" "https://api.github.com/repos/${SOURCE}/releases/tags/${VERSION}")
+          fi
+          [ -n "$REL" ] || { echo "::error::取 Release 失败（仓库或 tag 不存在）"; exit 1; }
+
+          if [ -z "$VERSION" ]; then
+            VERSION=$(printf '%s' "$REL" | jq -r '.tag_name // empty')
+            [ -n "$VERSION" ] || { echo "::error::该仓库没有 Release"; exit 1; }
+            echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          fi
+
+          ASSET_INFO=$(printf '%s' "$REL" | jq -c --arg n "$ASSET" '.assets[] | select(.name == $n)' | head -n 1)
+          [ -n "$ASSET_INFO" ] || { echo "::error::Release $VERSION 中找不到资产 $ASSET"; exit 1; }
+
+          ASSET_ID=$(printf '%s' "$ASSET_INFO" | jq -r '.id')
+          ASSET_SIZE=$(printf '%s' "$ASSET_INFO" | jq -r '.size // 0')
+          RAW_DIGEST=$(printf '%s' "$ASSET_INFO" | jq -r '.digest // empty')
+          CHECKSUM_VALUE="${RAW_DIGEST#sha256:}"
+
+          {
+            echo "ASSET_ID=$ASSET_ID"
+            echo "ASSET_SIZE=$ASSET_SIZE"
+            echo "CHECKSUM_VALUE=$CHECKSUM_VALUE"
+          } >> "$GITHUB_ENV"
+          echo "🎯 ${ASSET} | ${ASSET_SIZE}B | digest=${CHECKSUM_VALUE:-（Release 未提供，下载后现算）}"
+
+      - name: 4. 下载资产
+        shell: bash
+        env:
+          GH_API_TOKEN: ${{ secrets.GH_API_TOKEN }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CALLBACK_URL:-}" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在跨海下载 Release 资产…\",\"projectType\":\"github_release\"}" || true
+          fi
+
+          LOCAL_FILE="/tmp/${PAN_FILE_NAME}"
+          AUTH=()
+          [ -n "${GH_API_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $GH_API_TOKEN")
+
+          FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
+          NEED_MB=$(( ASSET_SIZE / 1024 / 1024 ))
+          echo "预估体积 ~${NEED_MB}MB | 可用 ${FREE_MB}MB"
+          if [ $((FREE_MB - NEED_MB)) -lt 5120 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                        /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                        /usr/local/share/powershell /usr/share/swift
+            sudo apt-get clean
+          fi
+
+          # 用 assets API（带 Accept: octet-stream）下载，私库也能走 token
+          curl -sS -fL "${AUTH[@]}" \
+            -H "Accept: application/octet-stream" -H "User-Agent: getits-mirror-action" \
+            -o "$LOCAL_FILE" \
+            "https://api.github.com/repos/${SOURCE}/releases/assets/${ASSET_ID}"
+
+          SIZE_BYTES=$(stat -c%s "$LOCAL_FILE")
+          if [ -z "${CHECKSUM_VALUE:-}" ]; then
+            CHECKSUM_VALUE=$(sha256sum "$LOCAL_FILE" | awk '{print $1}')
+          fi
+          {
+            echo "LOCAL_FILE=$LOCAL_FILE"
+            echo "SIZE_BYTES=$SIZE_BYTES"
+            echo "CHECKSUM_VALUE=$CHECKSUM_VALUE"
+          } >> "$GITHUB_ENV"
+          echo "下载完成 ${SIZE_BYTES}B | sha256=$CHECKSUM_VALUE"
+
+      - name: 5. 领取网盘凭证
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          CRED_URL="${CALLBACK_URL%/callback}/drive/credential?profile_id=${PROFILE_ID}"
+          CRED=$(curl -sS -f "$CRED_URL" -H "X-Callback-Secret: $CALLBACK_SECRET")
+          DRIVE_TYPE=$(echo "$CRED" | jq -r '.data.drive_type // empty')
+          COOKIE=$(echo "$CRED" | jq -r '.data.cookie // empty')
+          ROOT_FOLDER=$(echo "$CRED" | jq -r '.data.root_folder // empty')
+          ALIST_DRIVER=$(echo "$CRED" | jq -r '.data.alist_driver // empty')
+          if [ -z "$COOKIE" ]; then
+            echo "::error::领取网盘凭证失败：$(echo "$CRED" | jq -r '.message // "响应为空"')"
+            exit 1
+          fi
+          [ -n "$ROOT_FOLDER" ] || ROOT_FOLDER="${DEFAULT_ROOT:-/github_releases}"
+          echo "::add-mask::$(printf '%s' "$COOKIE" | tr -d '\r\n')"
+          {
+            echo "DRIVE_TYPE=$DRIVE_TYPE"
+            echo "ROOT_FOLDER=$ROOT_FOLDER"
+            echo "ALIST_DRIVER=$ALIST_DRIVER"
+            echo "COOKIE<<__COOKIE_EOF__"
+            printf '%s\n' "$COOKIE"
+            echo "__COOKIE_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: 6. 启动 AList 并挂载网盘
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null
+          for _ in $(seq 1 60); do
+            curl -s http://127.0.0.1:5244/api/public/settings > /dev/null && break
+            sleep 1
+          done
+          docker exec alist_sync ./alist admin set 123456 > /dev/null
+          TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"123456"}' | jq -r '.data.token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::AList 登录失败"
+            exit 1
+          fi
+          echo "ALIST_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          case "$ALIST_DRIVER" in
+            Quark)        ADDITION=$(jq -n --arg c "$COOKIE" '{cookie:$c, root_folder_id:"0"}') ;;
+            BaiduNetdisk) ADDITION=$(jq -n --arg c "$COOKIE" '{cookie:$c, root_folder:"/"}') ;;
+            *)            ADDITION=$(jq -n --arg c "$COOKIE" '{cookie:$c}') ;;
+          esac
+
+          MOUNT=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
+            -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg mp "/pan" --arg d "$ALIST_DRIVER" --arg a "$ADDITION" \
+                  '{mount_path:$mp, order:0, remark:"temp", driver:$d, addition:$a}')")
+          CODE=$(echo "$MOUNT" | jq -r '.code // 500')
+          if [ "$CODE" != "200" ]; then
+            echo "::error::网盘挂载失败（$ALIST_DRIVER）：$(echo "$MOUNT" | jq -r '.message // "未知"')"
+            exit 1
+          fi
+
+      - name: 7. 上传并取文件 ID
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          DEST_DIR="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
+          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p}')" > /dev/null
+
+          # 同 tag 重拉先删旧文件，避免同名冲突
+          curl -s -X POST http://127.0.0.1:5244/api/fs/remove \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg d "$DEST_DIR" --arg n "$PAN_FILE_NAME" '{dir:$d, names:[$n]}')" > /dev/null || true
+
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"uploading\",\"message\":\"正在直传网盘…\",\"projectType\":\"github_release\"}" || true
+          fi
+
+          echo "📤 上传中：$PAN_FILE_NAME"
+          curl -sS -X PUT \
+            -H "Authorization: $ALIST_TOKEN" \
+            -H "File-Path: ${DEST_DIR}/${PAN_FILE_NAME}" \
+            -H "As-Task: false" \
+            -T "$LOCAL_FILE" \
+            "http://127.0.0.1:5244/api/fs/put" > upload_res.json
+          UPLOAD_CODE=$(jq -r '.code // 500' upload_res.json)
+          if [ "$UPLOAD_CODE" != "200" ]; then
+            echo "::error::上传失败：$(jq -r '.message // "未知"' upload_res.json)"
+            exit 1
+          fi
+
+          LIST=$(curl -s -X POST http://127.0.0.1:5244/api/fs/list \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p, page:1, per_page:50}')")
+          FID=$(echo "$LIST" | jq -r --arg fn "$PAN_FILE_NAME" \
+            '.data.content[] | select(.name == $fn) | (.provider_id // .id // .fid // .raw.id) | select(. != null)' | head -n 1)
+          echo "🔑 文件 ID: ${FID:-（未取到）}"
+          {
+            echo "DRIVE_FID=$FID"
+            echo "PAN_PATH=${ROOT_FOLDER}/${CATEGORY_DIR}/${PAN_FILE_NAME}"
+          } >> "$GITHUB_ENV"
+
+      - name: 8. 回调后端（上传完成）
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          PAYLOAD=$(jq -n \
+            --arg taskId "$TASK_ID" \
+            --arg projectType "github_release" \
+            --arg sourceName "$SOURCE" \
+            --arg version "$VERSION" \
+            --arg arch "$ASSET" \
+            --arg checksumAlgo "sha256" \
+            --arg checksumValue "$CHECKSUM_VALUE" \
+            --arg packFormat "raw" \
+            --argjson sizeBytes "${SIZE_BYTES:-0}" \
+            --arg driveFid "${DRIVE_FID:-}" \
+            --arg panPath "${PAN_PATH:-}" \
+            --arg panFileName "$PAN_FILE_NAME" \
+            --arg driveType "${DRIVE_TYPE:-}" \
+            '{taskId:$taskId, status:"uploaded", projectType:$projectType,
+              sourceName:$sourceName, version:$version, arch:$arch,
+              checksumAlgo:$checksumAlgo, checksumValue:$checksumValue,
+              packFormat:$packFormat, sizeBytes:$sizeBytes,
+              driveFid:$driveFid, panPath:$panPath, panFileName:$panFileName,
+              driveType:$driveType}')
+          curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CALLBACK_SECRET" \
+            -d "$PAYLOAD" || true
