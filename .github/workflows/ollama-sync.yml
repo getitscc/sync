@@ -143,7 +143,22 @@ jobs:
             /tmp/ollama_layers.tsv > /tmp/ollama_layers_u.tsv
 
           TOTAL_FILES=$(wc -l < /tmp/ollama_layers_u.tsv | tr -d ' ')
-          [ "$TOTAL_FILES" -gt 0 ] || fail "该 manifest 不含任何 layer，无法拉取"
+          if [ "$TOTAL_FILES" -le 0 ]; then
+            # 没有 layer 多半是 Ollama 云端模型：manifest 的 config 里带 remote_host，
+            # 内容跑在 ollama.com 上，registry 里本就没有可下载的文件层。
+            CONFIG_DIGEST=$(jq -r '.config.digest // empty' "$MANIFEST_FILE" 2>/dev/null || true)
+            REMOTE_HOST=""
+            REMOTE_MODEL=""
+            if [ -n "$CONFIG_DIGEST" ]; then
+              CONFIG_JSON=$(curl -sS -fL "${REG}/blobs/${CONFIG_DIGEST}" 2>/dev/null || true)
+              REMOTE_HOST=$(printf '%s' "$CONFIG_JSON" | jq -r '.remote_host // empty' 2>/dev/null || true)
+              REMOTE_MODEL=$(printf '%s' "$CONFIG_JSON" | jq -r '.remote_model // empty' 2>/dev/null || true)
+            fi
+            if [ -n "$REMOTE_HOST" ]; then
+              fail "该模型是 Ollama 云端模型（${REMOTE_MODEL:-$SOURCE} 托管在 ${REMOTE_HOST}，本地无文件可下载），无法同步到网盘。请改用本地可下载的模型（如 llama3.2、qwen2.5）。"
+            fi
+            fail "该 manifest 不含任何 layer，无法拉取（${SOURCE}:${VERSION}）"
+          fi
           TOTAL_BYTES=$(awk -F'\t' '{s+=$3} END{print s+0}' /tmp/ollama_layers_u.tsv)
           MAX_BYTES=$(awk -F'\t' 'BEGIN{m=0}{if($3>m)m=$3} END{print m+0}' /tmp/ollama_layers_u.tsv)
 
