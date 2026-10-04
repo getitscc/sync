@@ -283,12 +283,14 @@ jobs:
               ;;
           esac
 
-          # 阶段回调：开始上传
+          # 阶段回调：开始上传（含文件名与体积）
           if [ -n "$CALLBACK_URL" ]; then
             curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
               -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"uploading\",\"message\":\"正在直传网盘…\",\"projectType\":\"docker\"}" || true
+              -d "$(jq -n --arg t "$TASK_ID" --arg m \
+                    "正在上传 $PAN_FILE_NAME（$((SIZE_BYTES/1024/1024)) MB）" \
+                    '{taskId:$t, stage:"uploading", message:$m, projectType:"docker"}')" || true
           fi
 
           echo "📤 上传中：$PAN_FILE_NAME"
@@ -345,3 +347,15 @@ jobs:
             -H "Content-Type: application/json" \
             -H "X-Callback-Secret: $CALLBACK_SECRET" \
             -d "$PAYLOAD" || true
+
+      - name: 9. 失败回传（兜底）
+        if: failure()
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          [ -n "${CALLBACK_URL:-}" ] || exit 0
+          HINT="${FAIL_HINT:-后台任务失败：Docker 镜像拉取/上传中断，请查看 Actions 日志}"
+          curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
+            -d "$(jq -n --arg t "${TASK_ID:-manual}" --arg e "$HINT" '{taskId:$t,status:"failed",error:$e}')" || true
