@@ -243,6 +243,15 @@ jobs:
           }
           trap 'notify_failed "HF 上传失败（脚本第 $LINENO 行）"' ERR
 
+          notify() {   # $1=stage  $2=message
+            [ -n "${CALLBACK_URL:-}" ] || return 0
+            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$(jq -n --arg t "$TASK_ID" --arg s "$1" --arg m "$2" \
+                    '{taskId:$t, stage:$s, message:$m}')" || true
+          }
+          notify pulling "已获取文件清单：共 ${TOTAL_FILES} 个文件（$((TOTAL_BYTES/1024/1024)) MB），开始跨海拉取…"
+
           mkdir -p /tmp/hf_batch
           declare -A TMPFILE=() CREATED_DIR=()
 
@@ -263,21 +272,25 @@ jobs:
           }
 
           part=0; done_files=0
+          LAST_NOTIFY=0; NOTIFY_EVERY_FILES=5; NOTIFY_EVERY_SECS=10
           declare -a BATCH=(); batch_bytes=0
 
-          progress() {
-            [ -n "${CALLBACK_URL:-}" ] || return 0
-            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
-              -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "$(jq -n --arg t "$TASK_ID" --arg m \
-                    "已上传 ${done_files}/${TOTAL_FILES} 个文件（第 ${part} 批）" \
-                    '{taskId:$t, stage:"uploading", message:$m}')" || true
+          progress() {   # $1=当前文件；每 5 个文件或每 10 秒汇总上报一次，末尾必报
+            local now; now=$(date +%s)
+            if [ $((done_files % NOTIFY_EVERY_FILES)) -ne 0 ] \
+               && [ $((now - LAST_NOTIFY)) -lt "$NOTIFY_EVERY_SECS" ] \
+               && [ "$done_files" -lt "$TOTAL_FILES" ]; then
+              return 0
+            fi
+            LAST_NOTIFY=$now
+            notify uploading "已上传 ${done_files}/${TOTAL_FILES} 个文件（第 $((part+1)) 批）：$1"
           }
 
           flush_batch() {
             [ "${#BATCH[@]}" -gt 0 ] || return 0
             local p s tmp dest
             echo "⬇️  下载第 $((part+1)) 批：${#BATCH[@]} 个文件，$((batch_bytes/1024/1024)) MB"
+            notify pulling "正在跨海拉取第 $((part+1)) 批：${#BATCH[@]} 个文件（$((batch_bytes/1024/1024)) MB）"
             for entry in "${BATCH[@]}"; do
               p="${entry%%|*}"; s="${entry##*|}"
               [ "$s" -le "$STAGE_LIMIT_BYTES" ] || continue   # 超大文件留到上传阶段流式
@@ -293,6 +306,7 @@ jobs:
               mkdir_pan "$(dirname "$dest")"
               if [ "$s" -gt "$STAGE_LIMIT_BYTES" ]; then
                 echo "   ↳ 流式直传（$((s/1024/1024)) MB）：$p"
+                notify pulling "正在跨海拉取（流式）：$p"
                 curl -sS -fL "${AUTH[@]}" "$RESOLVE/$p" | curl -sS -f -X PUT \
                   -H "Authorization: $ALIST_TOKEN" \
                   -H "File-Path: $dest" -H "As-Task: false" \
@@ -303,9 +317,9 @@ jobs:
                 rm -f "${TMPFILE[$p]}"; unset 'TMPFILE[$p]'
               fi
               done_files=$((done_files+1))
+              progress "$p"
             done
             BATCH=(); batch_bytes=0; part=$((part+1))
-            progress
           }
 
           while IFS=$'\t' read -r p s; do
