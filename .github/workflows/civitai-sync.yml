@@ -126,9 +126,6 @@ jobs:
               -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在跨海下载 Civitai 模型…\",\"projectType\":\"civitai\"}" || true
           fi
 
-          AUTH=()
-          [ -n "${CIVITAI_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $CIVITAI_TOKEN")
-
           NEED_MB=$(( ${FILE_SIZE_KB:-0} / 1024 ))
           FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
           echo "预估体积 ~${NEED_MB}MB | 可用 ${FREE_MB}MB"
@@ -149,8 +146,11 @@ jobs:
             esac
           fi
 
+          echo "Token set: $([ -n "${CIVITAI_TOKEN:-}" ] && echo yes || echo NO) | URL 带 token: $(printf '%s' "$DL_URL" | grep -c 'token=')"
+
+          # 注意：下载端点只认 ?token=，带上 Authorization 头会直接判 401，故此处不传 AUTH
           LOCAL_FILE="/tmp/${PAN_FILE_NAME}"
-          HTTP_CODE=$(curl -sS -fL -w '%{http_code}' "${AUTH[@]}" -o "$LOCAL_FILE" "$DL_URL") || {
+          HTTP_CODE=$(curl -sS -fL -w '%{http_code}' -o "$LOCAL_FILE" "$DL_URL") || {
             echo "FAIL_HINT=Civitai 文件下载失败（HTTP ${HTTP_CODE:-?}；401/403 表示 CIVITAI_TOKEN 缺失、失效，或该模型未开放下载权限）" >> "$GITHUB_ENV"
             echo "::error::下载文件失败（HTTP ${HTTP_CODE:-?}）"; exit 1; }
           SIZE_BYTES=$(stat -c%s "$LOCAL_FILE")
