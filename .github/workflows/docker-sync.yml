@@ -78,7 +78,7 @@ jobs:
 
           CATEGORY_DIR="${SOURCE##*/}"
           SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
-          PAN_FILE_NAME="${SAFE_NAME}_${VERSION}_${ARCH_SAFE}.tar.gz"
+          PAN_FILE_NAME="${SAFE_NAME}_${VERSION}_${ARCH_SAFE}.tar"
 
           # 本步骤内也要用到，所以先落成 shell 变量（写进 GITHUB_ENV 只对后续步骤生效）
           TASK_ID="${IN_TASK:-manual_$(date +%s)}"
@@ -160,9 +160,11 @@ jobs:
           PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
           [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
 
-          LOCAL_TAR="/tmp/${PAN_FILE_NAME%.gz}"
+          LOCAL_TAR="/tmp/${PAN_FILE_NAME}"
           skopeo copy "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
+          # pigz 会产出 .tar.gz，再改回 .tar 命名（内容仍是 gzip，与旧文件命名保持一致）
           pigz -9 -p 4 "$LOCAL_TAR"
+          mv "${LOCAL_TAR}.gz" "$LOCAL_TAR"
 
           # 平台 manifest digest：必须与服务端 platform_digest 算法完全一致，否则回调时会
           # 被判「校验值不一致」。注意 skopeo inspect 的 {{.Digest}} 在多架构镜像下返回的是
@@ -327,7 +329,7 @@ jobs:
             --arg arch "${ARCH:-}" \
             --arg checksumAlgo "docker-manifest-digest" \
             --arg checksumValue "$CHECKSUM_VALUE" \
-            --arg packFormat "tar.gz" \
+            --arg packFormat "tar" \
             --argjson sizeBytes "${SIZE_BYTES:-0}" \
             --arg driveFid "${DRIVE_FID:-}" \
             --arg panPath "${PAN_PATH:-}" \
