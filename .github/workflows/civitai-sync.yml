@@ -139,10 +139,20 @@ jobs:
             sudo apt-get clean
           fi
 
+          # Civitai 下载端点只认 ?token= 查询参数，Bearer 头会被拒（401）；此处统一补齐 token
+          DL_URL="$DOWNLOAD_URL"
+          if [ -n "${CIVITAI_TOKEN:-}" ]; then
+            case "$DL_URL" in
+              *token=*) ;;                                   # 已带 token，原样使用
+              *\?*)     DL_URL="${DL_URL}&token=${CIVITAI_TOKEN}" ;;
+              *)        DL_URL="${DL_URL}?token=${CIVITAI_TOKEN}" ;;
+            esac
+          fi
+
           LOCAL_FILE="/tmp/${PAN_FILE_NAME}"
-          curl -sS -fL "${AUTH[@]}" -o "$LOCAL_FILE" "$DOWNLOAD_URL" || {
-            echo "FAIL_HINT=Civitai 文件下载失败（HTTP 401/403 多为 CIVITAI_TOKEN 缺失或失效）" >> "$GITHUB_ENV"
-            echo "::error::下载文件失败"; exit 1; }
+          HTTP_CODE=$(curl -sS -fL -w '%{http_code}' "${AUTH[@]}" -o "$LOCAL_FILE" "$DL_URL") || {
+            echo "FAIL_HINT=Civitai 文件下载失败（HTTP ${HTTP_CODE:-?}；401/403 表示 CIVITAI_TOKEN 缺失、失效，或该模型未开放下载权限）" >> "$GITHUB_ENV"
+            echo "::error::下载文件失败（HTTP ${HTTP_CODE:-?}）"; exit 1; }
           SIZE_BYTES=$(stat -c%s "$LOCAL_FILE")
           if [ -z "${CHECKSUM_VALUE:-}" ]; then
             CHECKSUM_VALUE=$(sha256sum "$LOCAL_FILE" | awk '{print $1}')
