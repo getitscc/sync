@@ -1,8 +1,13 @@
 name: Ollama Sync
 
 # 由后端 repository_dispatch 触发（event_type=download_ollama），也可手动运行。
-# 本文件自包含：读 manifest → 取 GGUF 模型层 → 下载 blob → 领凭证 → 挂网盘 → 上传 → 回调。
-# 产物形态：只拉取 manifest 中 mediaType=application/vnd.ollama.image.model 的「原始 GGUF 模型」那一层。
+# 本文件自包含：读 manifest → 列出全部 layer → 逐层原始下载（不压缩、不打包）→ 领凭证 →
+# 挂网盘 → 逐文件上传 → 回调，不依赖其它自定义 Action。
+#
+# 产物形态：拉取 manifest 里**全部 layers**，按 mediaType 命名后原样保存
+#   model → model.gguf，projector → projector，template → template，params → params.json，
+#   license → license.txt，system → system.txt，其余按 mediaType 末段命名。
+#   收尾取**资源目录的 fid** 回调，设备端分享整个目录 → 一个链接覆盖该模型全部文件。
 
 on:
   repository_dispatch:
@@ -56,19 +61,33 @@ jobs:
 
           CATEGORY_DIR="${SOURCE##*/}"
           SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
-          PAN_FILE_NAME="${SAFE_NAME}_${VERSION}.gguf"
           {
             echo "SOURCE=$SOURCE"
             echo "VERSION=$VERSION"
             echo "CATEGORY_DIR=$CATEGORY_DIR"
             echo "SAFE_NAME=$SAFE_NAME"
-            echo "PAN_FILE_NAME=$PAN_FILE_NAME"
             echo "DEFAULT_ROOT=/ollama_models"
             echo "PROFILE_ID=${IN_PROFILE:-ollama_quark}"
             echo "TASK_ID=${IN_TASK:-manual_$(date +%s)}"
             echo "CALLBACK_URL=$IN_CALLBACK"
           } >> "$GITHUB_ENV"
           echo "📋 $SOURCE @ $VERSION"
+
+          # 失败回传助手：任何步骤失败时把原因推给后端，前端即时显示「任务失败」。
+          # 用 marker 去重，保证「精确错误」优先、「兜底文案」不覆盖它。
+          # 不依赖 jq（此步可能早于工具链安装），用 sed 做最小 JSON 转义。
+          cat > /tmp/notify_failed.sh <<'EOS'
+          #!/usr/bin/env bash
+          [ -n "${CALLBACK_URL:-}" ] || exit 0
+          marker=/tmp/.callback_reported
+          [ -f "$marker" ] && exit 0
+          touch "$marker"
+          msg=$(printf '%s' "${1:-后台任务失败}" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')
+          curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" -H "X-Callback-Secret: ${CALLBACK_SECRET:-}" \
+            -d "{\"taskId\":\"${TASK_ID:-manual}\",\"status\":\"failed\",\"error\":\"$msg\"}" || true
+          EOS
+          chmod +x /tmp/notify_failed.sh
 
           if [ -n "$IN_CALLBACK" ]; then
             curl -sS -o /dev/null -f -X POST "$IN_CALLBACK" \
@@ -82,80 +101,85 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq curl jq
 
-      - name: 3. 读取 manifest 并定位 GGUF 层
+      - name: 3. 读取 manifest 并列出全部 layer
         shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
+          fail() { /tmp/notify_failed.sh "$1"; echo "::error::$1"; exit 1; }
+
           REG="https://registry.ollama.ai/v2/library/${SOURCE}"
-          MANIFEST=$(curl -sS -fL \
+          MANIFEST_FILE=/tmp/ollama_manifest.json
+          HEADERS_FILE=/tmp/ollama_headers.txt
+          curl -sS -fL -D "$HEADERS_FILE" -o "$MANIFEST_FILE" \
             -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-            "${REG}/manifests/${VERSION}")
-          [ -n "$MANIFEST" ] || { echo "::error::取 Ollama manifest 失败（模型或 tag 不存在）"; exit 1; }
+            "${REG}/manifests/${VERSION}" \
+            || fail "读取 Ollama manifest 失败（${SOURCE}:${VERSION} 不存在或网络异常）"
+          [ -s "$MANIFEST_FILE" ] || fail "Ollama manifest 为空（${SOURCE}:${VERSION}）"
 
-          LAYER=$(printf '%s' "$MANIFEST" | jq -c \
-            '[.layers[] | select(.mediaType == "application/vnd.ollama.image.model")] | first')
-          [ -n "$LAYER" ] && [ "$LAYER" != "null" ] || { echo "::error::该 manifest 不含 GGUF 模型层"; exit 1; }
+          # 校验值与后端 resolveArtifact 同口径：manifest 自身 digest（Docker-Content-Digest），
+          # 取不到时退回对 manifest 内容做 sha256，保证任一 layer 变化都能被检测到。
+          CHECKSUM_VALUE=$(grep -i '^docker-content-digest:' "$HEADERS_FILE" 2>/dev/null | awk '{print $2}' | tr -d '\r' | sed 's/^sha256://' || true)
+          [ -n "$CHECKSUM_VALUE" ] || CHECKSUM_VALUE=$(sha256sum "$MANIFEST_FILE" | awk '{print $1}')
 
-          LAYER_DIGEST=$(printf '%s' "$LAYER" | jq -r '.digest')
-          LAYER_SIZE=$(printf '%s' "$LAYER" | jq -r '.size // 0')
-          CHECKSUM_VALUE="${LAYER_DIGEST#sha256:}"
-          BLOB_URL="${REG}/blobs/${LAYER_DIGEST}"
+          # 全部 layer 逐个落成文件：按 mediaType 给出可读文件名
+          jq -r '
+            .layers[]
+            | (.mediaType // "") as $mt
+            | (if   $mt == "application/vnd.ollama.image.model"     then "model.gguf"
+               elif $mt == "application/vnd.ollama.image.projector" then "projector"
+               elif $mt == "application/vnd.ollama.image.template"  then "template"
+               elif $mt == "application/vnd.ollama.image.params"    then "params.json"
+               elif $mt == "application/vnd.ollama.image.license"   then "license.txt"
+               elif $mt == "application/vnd.ollama.image.system"    then "system.txt"
+               elif $mt == "application/vnd.ollama.image.adapter"   then "adapter"
+               else (($mt | split(".") | last) // "blob") end) as $name
+            | [$name, (.digest // ""), ((.size // 0) | tostring)] | @tsv
+          ' "$MANIFEST_FILE" > /tmp/ollama_layers.tsv
 
-          {
-            echo "BLOB_URL=$BLOB_URL"
-            echo "LAYER_SIZE=$LAYER_SIZE"
-            echo "CHECKSUM_VALUE=$CHECKSUM_VALUE"
-          } >> "$GITHUB_ENV"
-          echo "🎯 GGUF ${LAYER_DIGEST} | ${LAYER_SIZE}B"
+          # 同名（极少见）追加序号，避免互相覆盖
+          awk -F'\t' 'BEGIN{OFS="\t"} {n=$1; if (seen[n]++) { $1 = n "-" seen[n] } print}' \
+            /tmp/ollama_layers.tsv > /tmp/ollama_layers_u.tsv
 
-      - name: 4. 下载模型文件
-        shell: bash
-        env:
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
-        run: |
-          set -euo pipefail
-          if [ -n "${CALLBACK_URL:-}" ]; then
-            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
-              -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在跨海下载 Ollama 模型…\",\"projectType\":\"ollama\"}" || true
-          fi
+          TOTAL_FILES=$(wc -l < /tmp/ollama_layers_u.tsv | tr -d ' ')
+          [ "$TOTAL_FILES" -gt 0 ] || fail "该 manifest 不含任何 layer，无法拉取"
+          TOTAL_BYTES=$(awk -F'\t' '{s+=$3} END{print s+0}' /tmp/ollama_layers_u.tsv)
+          MAX_BYTES=$(awk -F'\t' 'BEGIN{m=0}{if($3>m)m=$3} END{print m+0}' /tmp/ollama_layers_u.tsv)
 
+          # 每批上限动态计算：本机可用磁盘 − 5GB 余量，向下取整到整 GB
+          MARGIN_MB=5120
           FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
-          NEED_MB=$(( LAYER_SIZE / 1024 / 1024 ))
-          echo "预估体积 ~${NEED_MB}MB | 可用 ${FREE_MB}MB"
-          if [ $((FREE_MB - NEED_MB)) -lt 5120 ]; then
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                        /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-                        /usr/local/share/powershell /usr/share/swift
-            sudo apt-get clean
-          fi
+          AVAIL_MB=$(( FREE_MB - MARGIN_MB )); [ "$AVAIL_MB" -lt 0 ] && AVAIL_MB=0
+          STAGE_LIMIT_MB=$(( AVAIL_MB / 1024 * 1024 ))
 
-          LOCAL_FILE="/tmp/${PAN_FILE_NAME}"
-          curl -sS -fL -o "$LOCAL_FILE" "$BLOB_URL"
-          SIZE_BYTES=$(stat -c%s "$LOCAL_FILE")
-          echo "LAYER_SIZE_FILE=$SIZE_BYTES"  # 供日志核对
+          echo "📦 文件数 ${TOTAL_FILES} | 合计 $((TOTAL_BYTES/1024/1024)) MB | 最大单文件 $((MAX_BYTES/1024/1024)) MB"
+          echo "💽 本地可用 ${FREE_MB} MB（留 ${MARGIN_MB} MB = 5GB 余量）→ 每批上限 ${STAGE_LIMIT_MB} MB（$((STAGE_LIMIT_MB/1024)) GB）"
+
           {
-            echo "LOCAL_FILE=$LOCAL_FILE"
-            echo "SIZE_BYTES=$SIZE_BYTES"
+            echo "CHECKSUM_VALUE=$CHECKSUM_VALUE"
+            echo "TOTAL_FILES=$TOTAL_FILES"
+            echo "TOTAL_BYTES=$TOTAL_BYTES"
+            echo "STAGE_LIMIT_MB=$STAGE_LIMIT_MB"
           } >> "$GITHUB_ENV"
-          echo "下载完成 ${SIZE_BYTES}B"
+          echo "🎯 manifest digest ${CHECKSUM_VALUE}"
 
-      - name: 5. 领取网盘凭证
+      - name: 4. 领取网盘凭证并挂载 AList
         shell: bash
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
+          fail() { /tmp/notify_failed.sh "$1"; echo "::error::$1"; exit 1; }
+
           CRED_URL="${CALLBACK_URL%/callback}/drive/credential?profile_id=${PROFILE_ID}"
-          CRED=$(curl -sS -f "$CRED_URL" -H "X-Callback-Secret: $CALLBACK_SECRET")
+          CRED=$(curl -sS -f "$CRED_URL" -H "X-Callback-Secret: $CALLBACK_SECRET") \
+            || fail "领取网盘凭证失败（凭证接口不可用）"
           DRIVE_TYPE=$(echo "$CRED" | jq -r '.data.drive_type // empty')
           COOKIE=$(echo "$CRED" | jq -r '.data.cookie // empty')
           ROOT_FOLDER=$(echo "$CRED" | jq -r '.data.root_folder // empty')
           ALIST_DRIVER=$(echo "$CRED" | jq -r '.data.alist_driver // empty')
-          if [ -z "$COOKIE" ]; then
-            echo "::error::领取网盘凭证失败：$(echo "$CRED" | jq -r '.message // "响应为空"')"
-            exit 1
-          fi
+          [ -n "$COOKIE" ] || fail "领取网盘凭证失败：$(echo "$CRED" | jq -r '.message // "响应为空"')"
           [ -n "$ROOT_FOLDER" ] || ROOT_FOLDER="${DEFAULT_ROOT:-/ollama_models}"
           echo "::add-mask::$(printf '%s' "$COOKIE" | tr -d '\r\n')"
           {
@@ -167,11 +191,7 @@ jobs:
             echo "__COOKIE_EOF__"
           } >> "$GITHUB_ENV"
 
-      - name: 6. 启动 AList 并挂载网盘
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null
+          docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null || fail "AList 容器启动失败"
           for _ in $(seq 1 60); do
             curl -s http://127.0.0.1:5244/api/public/settings > /dev/null && break
             sleep 1
@@ -180,10 +200,7 @@ jobs:
           TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login \
             -H "Content-Type: application/json" \
             -d '{"username":"admin","password":"123456"}' | jq -r '.data.token')
-          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-            echo "::error::AList 登录失败"
-            exit 1
-          fi
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || fail "AList 登录失败"
           echo "ALIST_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
           case "$ALIST_DRIVER" in
@@ -197,59 +214,91 @@ jobs:
             -d "$(jq -n --arg mp "/pan" --arg d "$ALIST_DRIVER" --arg a "$ADDITION" \
                   '{mount_path:$mp, order:0, remark:"temp", driver:$d, addition:$a}')")
           CODE=$(echo "$MOUNT" | jq -r '.code // 500')
-          if [ "$CODE" != "200" ]; then
-            echo "::error::网盘挂载失败（$ALIST_DRIVER）：$(echo "$MOUNT" | jq -r '.message // "未知"')"
-            exit 1
-          fi
+          [ "$CODE" = "200" ] || fail "网盘挂载失败（$ALIST_DRIVER）：$(echo "$MOUNT" | jq -r '.message // "未知"')"
 
-      - name: 7. 上传并取文件 ID
+      - name: 5. 逐层拉取并原样上传（不压缩）
         shell: bash
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
-          DEST_DIR="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
-          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
-            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
-            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p}')" > /dev/null
+          fail() { /tmp/notify_failed.sh "$1"; echo "::error::$1"; exit 1; }
 
-          curl -s -X POST http://127.0.0.1:5244/api/fs/remove \
-            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
-            -d "$(jq -n --arg d "$DEST_DIR" --arg n "$PAN_FILE_NAME" '{dir:$d, names:[$n]}')" > /dev/null || true
+          REG="https://registry.ollama.ai/v2/library/${SOURCE}"
+          ROOT_ON_PAN="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
+          STAGE_LIMIT_BYTES=$(( STAGE_LIMIT_MB * 1024 * 1024 ))
 
-          if [ -n "$CALLBACK_URL" ]; then
-            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+          notify() {   # $1=stage  $2=message
+            [ -n "${CALLBACK_URL:-}" ] || return 0
+            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "$(jq -n --arg t "$TASK_ID" --arg m \
-                    "正在上传 $PAN_FILE_NAME（$((SIZE_BYTES/1024/1024)) MB）" \
-                    '{taskId:$t, stage:"uploading", message:$m, projectType:"ollama"}')" || true
-          fi
+              -d "$(jq -n --arg t "$TASK_ID" --arg s "$1" --arg m "$2" \
+                    '{taskId:$t, stage:$s, message:$m, projectType:"ollama"}')" || true
+          }
 
-          echo "📤 上传中：$PAN_FILE_NAME"
-          curl -sS -X PUT \
-            -H "Authorization: $ALIST_TOKEN" \
-            -H "File-Path: ${DEST_DIR}/${PAN_FILE_NAME}" \
-            -H "As-Task: false" \
-            -T "$LOCAL_FILE" \
-            "http://127.0.0.1:5244/api/fs/put" > upload_res.json
-          UPLOAD_CODE=$(jq -r '.code // 500' upload_res.json)
-          if [ "$UPLOAD_CODE" != "200" ]; then
-            echo "::error::上传失败：$(jq -r '.message // "未知"' upload_res.json)"
-            exit 1
-          fi
+          mkdir_pan() {
+            curl -sS -X POST "http://127.0.0.1:5244/api/fs/mkdir" \
+              -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+              -d "$(jq -n --arg p "$1" '{path:$p}')" > /dev/null || true
+          }
 
-          LIST=$(curl -s -X POST http://127.0.0.1:5244/api/fs/list \
+          notify pulling "已获取文件清单：共 ${TOTAL_FILES} 个文件（$((TOTAL_BYTES/1024/1024)) MB），开始跨海拉取…"
+          mkdir_pan "$ROOT_ON_PAN"
+
+          done_files=0
+          while IFS=$'\t' read -r name digest size; do
+            [ -n "$name" ] || continue
+            [ -n "$digest" ] || fail "layer 缺少 digest（$name）"
+            size=${size:-0}
+            blob="${REG}/blobs/${digest}"
+            dest="${ROOT_ON_PAN}/${name}"
+            echo "   ↳ $name（$((size/1024/1024)) MB）"
+
+            if [ "$size" -gt "$STAGE_LIMIT_BYTES" ]; then
+              # 超大 layer：流式直传，不落盘
+              notify pulling "正在跨海拉取（流式）：$name（$((size/1024/1024)) MB）"
+              curl -sS -fL "$blob" | curl -sS -f -X PUT \
+                -H "Authorization: $ALIST_TOKEN" \
+                -H "File-Path: $dest" -H "As-Task: false" \
+                -T - "http://127.0.0.1:5244/api/fs/put" > /dev/null \
+                || fail "上传失败：$name"
+            else
+              tmp="/tmp/ollama_layer_${name}"
+              notify pulling "正在跨海拉取：$name（$((size/1024/1024)) MB）"
+              curl -sS -fL "$blob" -o "$tmp" || fail "下载失败：$name（$digest）"
+              curl -sS -f -X PUT "http://127.0.0.1:5244/api/fs/put" \
+                -H "Authorization: $ALIST_TOKEN" \
+                -H "File-Path: $dest" -H "As-Task: false" \
+                -T "$tmp" > /dev/null || fail "上传失败：$name"
+              rm -f "$tmp"
+            fi
+
+            done_files=$((done_files+1))
+            notify uploading "已上传 ${done_files}/${TOTAL_FILES} 个文件：$name"
+          done < /tmp/ollama_layers_u.tsv
+          echo "✅ 全部 ${done_files} 个文件已上传"
+
+      - name: 6. 取模型目录 fid
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          fail() { /tmp/notify_failed.sh "$1"; echo "::error::$1"; exit 1; }
+          PARENT="/pan${ROOT_FOLDER}"
+          LIST=$(curl -sS -f -X POST http://127.0.0.1:5244/api/fs/list \
             -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
-            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p, page:1, per_page:50}')")
-          FID=$(echo "$LIST" | jq -r --arg fn "$PAN_FILE_NAME" \
-            '.data.content[] | select(.name == $fn) | (.provider_id // .id // .fid // .raw.id) | select(. != null)' | head -n 1)
-          echo "🔑 文件 ID: ${FID:-（未取到）}"
+            -d "$(jq -n --arg p "$PARENT" '{path:$p, page:1, per_page:200}')") \
+            || fail "读取网盘目录失败"
+          FID=$(echo "$LIST" | jq -r --arg n "$CATEGORY_DIR" \
+            '.data.content[] | select(.name == $n) | (.provider_id // .id // .fid // .raw.id) | select(. != null)' | head -n 1)
+          echo "🔑 模型目录 fid: ${FID:-（未取到）}"
           {
             echo "DRIVE_FID=$FID"
-            echo "PAN_PATH=${ROOT_FOLDER}/${CATEGORY_DIR}/${PAN_FILE_NAME}"
+            echo "PAN_PATH=${ROOT_FOLDER}/${CATEGORY_DIR}"
           } >> "$GITHUB_ENV"
 
-      - name: 8. 回调后端（上传完成）
+      - name: 7. 回调后端（上传完成）
         shell: bash
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
@@ -263,11 +312,11 @@ jobs:
             --arg arch "" \
             --arg checksumAlgo "sha256" \
             --arg checksumValue "$CHECKSUM_VALUE" \
-            --arg packFormat "gguf" \
-            --argjson sizeBytes "${SIZE_BYTES:-0}" \
+            --arg packFormat "dir" \
+            --argjson sizeBytes "${TOTAL_BYTES:-0}" \
             --arg driveFid "${DRIVE_FID:-}" \
             --arg panPath "${PAN_PATH:-}" \
-            --arg panFileName "$PAN_FILE_NAME" \
+            --arg panFileName "$CATEGORY_DIR" \
             --arg driveType "${DRIVE_TYPE:-}" \
             '{taskId:$taskId, status:"uploaded", projectType:$projectType,
               sourceName:$sourceName, version:$version, arch:$arch,
@@ -279,3 +328,13 @@ jobs:
             -H "Content-Type: application/json" \
             -H "X-Callback-Secret: $CALLBACK_SECRET" \
             -d "$PAYLOAD" || true
+
+      - name: 8. 失败回传（兜底）
+        if: failure()
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -u
+          [ -x /tmp/notify_failed.sh ] || exit 0
+          bash /tmp/notify_failed.sh "后台任务失败：Ollama 拉取/上传中断（${SOURCE:-?}:${VERSION:-?}），请查看 Actions 日志"
