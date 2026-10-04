@@ -71,7 +71,7 @@ jobs:
             echo "SAFE_NAME=$SAFE_NAME"
             echo "PAN_FILE_NAME=$PAN_FILE_NAME"
             echo "DEFAULT_ROOT=/github_releases"
-            echo "PROFILE_ID=${IN_PROFILE:-gh_release_baidu}"
+            echo "PROFILE_ID=${IN_PROFILE:-gh_release_quark}"
             echo "TASK_ID=${IN_TASK:-manual_$(date +%s)}"
             echo "CALLBACK_URL=$IN_CALLBACK"
           } >> "$GITHUB_ENV"
@@ -239,7 +239,12 @@ jobs:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
-          DEST_DIR="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
+          # 目录结构：/github_releases/<项目>/<Release tag>/<资产>
+          #   - 同一个项目（仓库）→ 同一个项目文件夹
+          #   - 同一个 Release（tag）→ 同一个版本子文件夹
+          # tag 可能含斜杠（分支式 tag），替换成下划线避免多出一层目录
+          VERSION_DIR=$(printf '%s' "${VERSION:-latest}" | tr '/' '_')
+          DEST_DIR="/pan${ROOT_FOLDER}/${CATEGORY_DIR}/${VERSION_DIR}"
           curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
             -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
             -d "$(jq -n --arg p "$DEST_DIR" '{path:$p}')" > /dev/null
@@ -276,7 +281,7 @@ jobs:
           echo "🔑 文件 ID: ${FID:-（未取到）}"
           {
             echo "DRIVE_FID=$FID"
-            echo "PAN_PATH=${ROOT_FOLDER}/${CATEGORY_DIR}/${PAN_FILE_NAME}"
+            echo "PAN_PATH=${ROOT_FOLDER}/${CATEGORY_DIR}/${VERSION_DIR}/${PAN_FILE_NAME}"
           } >> "$GITHUB_ENV"
 
       - name: 8. 回调后端（上传完成）
