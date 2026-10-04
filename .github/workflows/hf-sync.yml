@@ -1,7 +1,13 @@
 name: HuggingFace Sync
 
 # 由后端 repository_dispatch 触发（event_type=download_hf），也可手动运行。
-# 本文件自包含：下载快照 → 打包 → 领凭证 → 挂网盘 → 上传 → 回调，不依赖其它自定义 Action。
+# 本文件自包含：列文件 → 体积评估 → 逐文件拉取 → 按体积分批上传 → 回调，不依赖其它自定义 Action。
+#
+# 与旧版差异：
+#   1) 不再「整仓打包成一个 tar.zst」，改为**逐文件**保留原目录结构上传到网盘；
+#   2) 按**累计体积**分批（默认 5GB，可通过 batch_max_mb 动态调整），一批拉完再传完；
+#   3) 上传前智能评估：单个文件超过本地可落盘上限时，走**流式直传**（不落盘）；
+#   4) 收尾取**模型目录的 fid** 回调，设备端分享该目录 → 一个链接覆盖整个模型仓库。
 
 on:
   repository_dispatch:
@@ -9,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       source_name:
-        description: '模型 repo_id（如 bert-base-uncased 或 Qwen/Qwen2.5-7B）'
+        description: '模型 repo_id（如 bert-base-uncased 或 Qwen/Qwen3-0.6B）'
         required: true
         default: 'bert-base-uncased'
       version:
@@ -28,6 +34,10 @@ on:
         description: '后端回调地址'
         required: false
         default: ''
+      batch_max_mb:
+        description: '每批累计体积上限（MB），默认 5120（5GB）'
+        required: false
+        default: '5120'
 
 jobs:
   sync:
@@ -40,12 +50,15 @@ jobs:
           IN_PROFILE: ${{ github.event.client_payload.profile_id || github.event.inputs.profile_id }}
           IN_TASK: ${{ github.event.client_payload.task_id || github.event.inputs.task_id }}
           IN_CALLBACK: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
+          IN_BATCH: ${{ github.event.client_payload.batch_max_mb || github.event.inputs.batch_max_mb }}
         run: |
           set -euo pipefail
           SOURCE=$(printf '%s' "$IN_SOURCE" | tr -d '\r' | xargs)
           VERSION=$(printf '%s' "$IN_VERSION" | tr -d '\r' | xargs)
+          BATCH_MAX_MB=$(printf '%s' "${IN_BATCH:-5120}" | tr -d '\r' | xargs)
           [ -n "$SOURCE" ] || { echo "::error::缺少 source_name"; exit 1; }
           [ -n "$VERSION" ] || VERSION="main"
+          case "$BATCH_MAX_MB" in (*[!0-9]*|'') BATCH_MAX_MB=5120 ;; esac
 
           SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
           CATEGORY_DIR="${SOURCE##*/}"
@@ -54,58 +67,79 @@ jobs:
             echo "VERSION=$VERSION"
             echo "SAFE_NAME=$SAFE_NAME"
             echo "CATEGORY_DIR=$CATEGORY_DIR"
+            echo "BATCH_MAX_MB=$BATCH_MAX_MB"
             echo "PROFILE_ID=${IN_PROFILE:-hf_quark}"
             echo "TASK_ID=${IN_TASK:-manual_$(date +%s)}"
             echo "CALLBACK_URL=$IN_CALLBACK"
           } >> "$GITHUB_ENV"
-          echo "📋 $SOURCE @ $VERSION"
+          echo "📋 $SOURCE @ $VERSION（每批上限 ${BATCH_MAX_MB} MB）"
 
       - name: 2. 安装工具链
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl jq zstd
-          pip install -q -U "huggingface_hub[hf_transfer]"
+          sudo apt-get install -y -qq curl jq
 
       - name: 3. 取 commit sha 作为校验值
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          AUTH=()
+          [ -n "${HF_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $HF_TOKEN")
+          if [ -n "${CALLBACK_URL:-}" ]; then
+            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$(jq -n --arg t "$TASK_ID" '{taskId:$t, stage:"prepared", message:"参数解析完成，准备拉取"}')" || true
+          fi
+          # -L 跟随仓库名大小写规范化产生的 307 重定向；-f 让 HTTP 错误直接失败而不是喂给 jq
+          # 与服务端 resolveArtifact 用同一个口径：整仓 commit sha（git-sha1）
+          SHA=$(curl -sS -fL "${AUTH[@]}" \
+            "https://huggingface.co/api/models/${SOURCE}/revision/${VERSION}" | jq -r '.sha // empty')
+          [ -n "$SHA" ] || { echo "::error::取 commit sha 失败（模型不存在或需要 HF_TOKEN）"; exit 1; }
+          echo "CHECKSUM_VALUE=$SHA" >> "$GITHUB_ENV"
+          echo "commit sha=$SHA"
+
+      - name: 4. 列文件并做体积评估
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -euo pipefail
           AUTH=()
           [ -n "${HF_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $HF_TOKEN")
-          # 与服务端 resolveArtifact 用同一个口径：整仓 commit sha（git-sha1）
-          SHA=$(curl -sS "${AUTH[@]}" \
-            "https://huggingface.co/api/models/${SOURCE}/revision/${VERSION}" | jq -r '.sha // empty')
-          [ -n "$SHA" ] || { echo "::error::取 commit sha 失败（模型不存在或需要 HF_TOKEN）"; exit 1; }
-          echo "CHECKSUM_VALUE=$SHA" >> "$GITHUB_ENV"
-          echo "commit sha=$SHA"
 
-      - name: 4. 下载并打包
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_ENABLE_HF_TRANSFER: "1"
-        run: |
-          set -euo pipefail
-          OUT="/tmp/${SAFE_NAME}_${VERSION}_${CHECKSUM_VALUE:0:8}.tar.zst"
-          LOCAL_DIR="/tmp/hf_snapshot"
-          rm -rf "$LOCAL_DIR"; mkdir -p "$LOCAL_DIR"
+          TREE=$(curl -sS -fL "${AUTH[@]}" \
+            "https://huggingface.co/api/models/${SOURCE}/tree/${VERSION}?recursive=1")
+          # 只取文件，按体积升序（大文件自然成为独立的「流式批」）
+          printf '%s' "$TREE" | jq -r '[.[] | select(.type=="file")] | sort_by(.size)
+            | .[] | [.path, (.size // 0 | tostring)] | @tsv' > /tmp/hf_files.tsv
 
-          if [ -n "${HF_TOKEN:-}" ]; then
-            hf download "$SOURCE" --revision "$VERSION" --local-dir "$LOCAL_DIR" --token "$HF_TOKEN"
-          else
-            hf download "$SOURCE" --revision "$VERSION" --local-dir "$LOCAL_DIR"
+          TOTAL_FILES=$(wc -l < /tmp/hf_files.tsv | tr -d ' ')
+          [ "$TOTAL_FILES" -gt 0 ] || { echo "::error::该 revision 没有任何文件"; exit 1; }
+          TOTAL_BYTES=$(awk -F'\t' '{s+=$2} END{print s+0}' /tmp/hf_files.tsv)
+          MAX_BYTES=$(awk -F'\t' 'BEGIN{m=0}{if($2>m)m=$2} END{print m+0}' /tmp/hf_files.tsv)
+
+          MARGIN_MB=1024
+          FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
+          AVAIL_MB=$(( FREE_MB - MARGIN_MB )); [ "$AVAIL_MB" -lt 0 ] && AVAIL_MB=0
+          # 落盘上限 = min(每批上限, 本地可用空间)
+          STAGE_LIMIT_MB=$BATCH_MAX_MB
+          [ "$STAGE_LIMIT_MB" -gt "$AVAIL_MB" ] && STAGE_LIMIT_MB=$AVAIL_MB
+
+          echo "📦 文件数 ${TOTAL_FILES} | 合计 $((TOTAL_BYTES/1024/1024)) MB | 最大单文件 $((MAX_BYTES/1024/1024)) MB"
+          echo "💽 本地可用 ${FREE_MB} MB（留 ${MARGIN_MB} MB 余量）→ 落盘上限 ${STAGE_LIMIT_MB} MB"
+          if [ "$MAX_BYTES" -gt $((STAGE_LIMIT_MB*1024*1024)) ]; then
+            echo "⚠️ 最大文件超过落盘上限，该文件将走流式直传（不落盘）"
           fi
 
-          tar -cf - -C "$LOCAL_DIR" . | zstd -T0 -19 -o "$OUT"
-          SIZE_BYTES=$(stat -c%s "$OUT")
           {
-            echo "LOCAL_FILE=$OUT"
-            echo "PAN_FILE_NAME=${SAFE_NAME}_${VERSION}_${CHECKSUM_VALUE:0:8}.tar.zst"
-            echo "SIZE_BYTES=$SIZE_BYTES"
+            echo "TOTAL_FILES=$TOTAL_FILES"
+            echo "TOTAL_BYTES=$TOTAL_BYTES"
+            echo "MAX_BYTES=$MAX_BYTES"
+            echo "STAGE_LIMIT_MB=$STAGE_LIMIT_MB"
           } >> "$GITHUB_ENV"
-          echo "打包完成：${SIZE_BYTES}B"
 
-      - name: 5. 领取网盘凭证
+      - name: 5. 领取网盘凭证并挂载 AList
         shell: bash
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
@@ -121,6 +155,7 @@ jobs:
             echo "::error::领取网盘凭证失败：$(echo "$CRED" | jq -r '.message // "响应为空"')"
             exit 1
           fi
+          [ -n "$ROOT_FOLDER" ] || ROOT_FOLDER="/huggingface_models"
           # 单行形式也遮一遍（多行 Cookie 的逐行遮罩由平台的 secret 机制兜底）
           echo "::add-mask::$(printf '%s' "$COOKIE" | tr -d '\r\n')"
           {
@@ -132,10 +167,6 @@ jobs:
             echo "__COOKIE_EOF__"
           } >> "$GITHUB_ENV"
 
-      - name: 6. 启动 AList 并挂载网盘
-        shell: bash
-        run: |
-          set -euo pipefail
           docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null
           for _ in $(seq 1 60); do
             curl -s http://127.0.0.1:5244/api/public/settings > /dev/null && break
@@ -168,46 +199,124 @@ jobs:
             exit 1
           fi
 
-      - name: 7. 上传并取文件 ID
+      - name: 6. 逐文件拉取并按体积分批上传
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          RESOLVE="https://huggingface.co/${SOURCE}/resolve/${VERSION}"
+          ROOT_ON_PAN="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
+          STAGE_LIMIT_BYTES=$(( STAGE_LIMIT_MB * 1024 * 1024 ))
+          AUTH=()
+          [ -n "${HF_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $HF_TOKEN")
+
+          notify_failed() {
+            [ -n "${CALLBACK_URL:-}" ] || return 0
+            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$(jq -n --arg t "$TASK_ID" --arg e "$1" '{taskId:$t,status:"failed",error:$e}')" || true
+            return 0
+          }
+          trap 'notify_failed "HF 上传失败（脚本第 $LINENO 行）"' ERR
+
+          mkdir -p /tmp/hf_batch
+          declare -A TMPFILE=() CREATED_DIR=()
+
+          mkdir_pan() {
+            local dir="$1"
+            [ -n "${CREATED_DIR[$dir]:-}" ] && return 0
+            curl -sS -X POST "http://127.0.0.1:5244/api/fs/mkdir" \
+              -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+              -d "$(jq -n --arg p "$dir" '{path:$p}')" > /dev/null || true
+            CREATED_DIR[$dir]=1
+          }
+
+          put_local() {   # $1=网盘路径  $2=本地文件
+            curl -sS -f -X PUT "http://127.0.0.1:5244/api/fs/put" \
+              -H "Authorization: $ALIST_TOKEN" \
+              -H "File-Path: $1" -H "As-Task: false" \
+              -T "$2" > /dev/null
+          }
+
+          part=0; done_files=0
+          declare -a BATCH=(); batch_bytes=0
+
+          progress() {
+            [ -n "${CALLBACK_URL:-}" ] || return 0
+            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$(jq -n --arg t "$TASK_ID" --arg m \
+                    "已上传 ${done_files}/${TOTAL_FILES} 个文件（第 ${part} 批）" \
+                    '{taskId:$t, stage:"uploading", message:$m}')" || true
+          }
+
+          flush_batch() {
+            [ "${#BATCH[@]}" -gt 0 ] || return 0
+            local p s tmp dest
+            echo "⬇️  下载第 $((part+1)) 批：${#BATCH[@]} 个文件，$((batch_bytes/1024/1024)) MB"
+            for entry in "${BATCH[@]}"; do
+              p="${entry%%|*}"; s="${entry##*|}"
+              [ "$s" -le "$STAGE_LIMIT_BYTES" ] || continue   # 超大文件留到上传阶段流式
+              tmp="$(mktemp /tmp/hf_batch/part.XXXXXX)"
+              curl -sS -fL "${AUTH[@]}" -o "$tmp" "$RESOLVE/$p"
+              TMPFILE["$p"]="$tmp"
+            done
+
+            echo "⬆️  上传第 $((part+1)) 批"
+            for entry in "${BATCH[@]}"; do
+              p="${entry%%|*}"; s="${entry##*|}"
+              dest="$ROOT_ON_PAN/$p"
+              mkdir_pan "$(dirname "$dest")"
+              if [ "$s" -gt "$STAGE_LIMIT_BYTES" ]; then
+                echo "   ↳ 流式直传（$((s/1024/1024)) MB）：$p"
+                curl -sS -fL "${AUTH[@]}" "$RESOLVE/$p" | curl -sS -f -X PUT \
+                  -H "Authorization: $ALIST_TOKEN" \
+                  -H "File-Path: $dest" -H "As-Task: false" \
+                  -T - "http://127.0.0.1:5244/api/fs/put" > /dev/null
+              else
+                echo "   ↳ 上传：$p"
+                put_local "$dest" "${TMPFILE[$p]}"
+                rm -f "${TMPFILE[$p]}"; unset 'TMPFILE[$p]'
+              fi
+              done_files=$((done_files+1))
+            done
+            BATCH=(); batch_bytes=0; part=$((part+1))
+            progress
+          }
+
+          while IFS=$'\t' read -r p s; do
+            [ -n "$p" ] || continue
+            s=${s:-0}
+            if [ "$s" -gt "$STAGE_LIMIT_BYTES" ]; then
+              flush_batch
+              BATCH=("$p|$s"); batch_bytes="$s"; flush_batch
+            else
+              if [ "${#BATCH[@]}" -gt 0 ] && [ $((batch_bytes + s)) -gt "$STAGE_LIMIT_BYTES" ]; then
+                flush_batch
+              fi
+              BATCH+=("$p|$s"); batch_bytes=$((batch_bytes + s))
+            fi
+          done < /tmp/hf_files.tsv
+          flush_batch
+          rm -rf /tmp/hf_batch
+          echo "✅ 全部 ${done_files} 个文件已上传，共 ${part} 批"
+
+      - name: 7. 取模型目录 fid
         shell: bash
         run: |
           set -euo pipefail
-          DEST_DIR="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
-          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
-            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
-            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p}')" > /dev/null
-
-          # 移动标签（latest/stable/main）指向的内容会变：先删旧文件，避免同名冲突
-          case "$VERSION" in
-            latest|stable|main)
-              curl -s -X POST http://127.0.0.1:5244/api/fs/remove \
-                -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
-                -d "$(jq -n --arg d "$DEST_DIR" --arg n "$PAN_FILE_NAME" '{dir:$d, names:[$n]}')" > /dev/null
-              ;;
-          esac
-
-          echo "📤 上传中：$PAN_FILE_NAME"
-          curl -sS -X PUT \
-            -H "Authorization: $ALIST_TOKEN" \
-            -H "File-Path: ${DEST_DIR}/${PAN_FILE_NAME}" \
-            -H "As-Task: false" \
-            -T "$LOCAL_FILE" \
-            "http://127.0.0.1:5244/api/fs/put" > upload_res.json
-          UPLOAD_CODE=$(jq -r '.code // 500' upload_res.json)
-          if [ "$UPLOAD_CODE" != "200" ]; then
-            echo "::error::上传失败：$(jq -r '.message // "未知"' upload_res.json)"
-            exit 1
-          fi
-
+          PARENT="/pan${ROOT_FOLDER}"
           LIST=$(curl -s -X POST http://127.0.0.1:5244/api/fs/list \
             -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
-            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p, page:1, per_page:50}')")
-          FID=$(echo "$LIST" | jq -r --arg fn "$PAN_FILE_NAME" \
-            '.data.content[] | select(.name == $fn) | (.provider_id // .id // .fid // .raw.id) | select(. != null)' | head -n 1)
-          echo "🔑 文件 ID: ${FID:-（未取到）}"
+            -d "$(jq -n --arg p "$PARENT" '{path:$p, page:1, per_page:200}')")
+          FID=$(echo "$LIST" | jq -r --arg n "$CATEGORY_DIR" \
+            '.data.content[] | select(.name == $n) | (.provider_id // .id // .fid // .raw.id) | select(. != null)' | head -n 1)
+          echo "🔑 模型目录 fid: ${FID:-（未取到）}"
           {
             echo "DRIVE_FID=$FID"
-            echo "PAN_PATH=${ROOT_FOLDER}/${CATEGORY_DIR}/${PAN_FILE_NAME}"
+            echo "PAN_PATH=${ROOT_FOLDER}/${CATEGORY_DIR}"
           } >> "$GITHUB_ENV"
 
       - name: 8. 回调后端（上传完成）
@@ -224,11 +333,11 @@ jobs:
             --arg arch "" \
             --arg checksumAlgo "git-sha1" \
             --arg checksumValue "$CHECKSUM_VALUE" \
-            --arg packFormat "dir-tar.zst" \
-            --argjson sizeBytes "${SIZE_BYTES:-0}" \
+            --arg packFormat "dir" \
+            --argjson sizeBytes "${TOTAL_BYTES:-0}" \
             --arg driveFid "${DRIVE_FID:-}" \
             --arg panPath "${PAN_PATH:-}" \
-            --arg panFileName "$PAN_FILE_NAME" \
+            --arg panFileName "$CATEGORY_DIR" \
             --arg driveType "${DRIVE_TYPE:-}" \
             '{taskId:$taskId, status:"uploaded", projectType:$projectType,
               sourceName:$sourceName, version:$version, arch:$arch,
