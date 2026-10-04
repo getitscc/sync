@@ -97,7 +97,7 @@ jobs:
           DOWNLOAD_URL=$(printf '%s' "$FILE" | jq -r '.downloadUrl // empty')
           PAN_FILE_NAME=$(printf '%s' "$FILE" | jq -r '.name // empty')
           CHECKSUM_VALUE=$(printf '%s' "$FILE" | jq -r '(.hashes.SHA256 // "") | ascii_downcase')
-          FILE_SIZE_KB=$(printf '%s' "$FILE" | jq -r '.sizeKB // 0')
+          FILE_SIZE_KB=$(printf '%s' "$FILE" | jq -r '(.sizeKB // 0) | floor')
           [ -n "$DOWNLOAD_URL" ] || { echo "::error::取下载地址失败（可能需要 CIVITAI_TOKEN 或该文件不公开）"; exit 1; }
           [ -n "$PAN_FILE_NAME" ] || PAN_FILE_NAME="civitai_${VERSION}.safetensors"
 
@@ -125,7 +125,7 @@ jobs:
           AUTH=()
           [ -n "${CIVITAI_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $CIVITAI_TOKEN")
 
-          NEED_MB=$(( FILE_SIZE_KB / 1024 ))
+          NEED_MB=$(( ${FILE_SIZE_KB:-0} / 1024 ))
           FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
           echo "预估体积 ~${NEED_MB}MB | 可用 ${FREE_MB}MB"
           if [ $((FREE_MB - NEED_MB)) -lt 5120 ]; then
