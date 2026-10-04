@@ -5,8 +5,8 @@ name: HuggingFace Sync
 #
 # 与旧版差异：
 #   1) 不再「整仓打包成一个 tar.zst」，改为**逐文件**保留原目录结构上传到网盘；
-#   2) 按**累计体积**分批（默认 5GB，可通过 batch_max_mb 动态调整），一批拉完再传完；
-#   3) 上传前智能评估：单个文件超过本地可落盘上限时，走**流式直传**（不落盘）；
+#   2) 分批体积**动态计算**：先读本机可用磁盘，扣掉 5GB 余量后向下取整到整 GB 作为每批上限，一批拉完再传完；
+#   3) 上传前智能评估：单个文件超过该上限时，走**流式直传**（不落盘）；
 #   4) 收尾取**模型目录的 fid** 回调，设备端分享该目录 → 一个链接覆盖整个模型仓库。
 
 on:
@@ -34,10 +34,6 @@ on:
         description: '后端回调地址'
         required: false
         default: ''
-      batch_max_mb:
-        description: '每批累计体积上限（MB），默认 5120（5GB）'
-        required: false
-        default: '5120'
 
 jobs:
   sync:
@@ -50,15 +46,12 @@ jobs:
           IN_PROFILE: ${{ github.event.client_payload.profile_id || github.event.inputs.profile_id }}
           IN_TASK: ${{ github.event.client_payload.task_id || github.event.inputs.task_id }}
           IN_CALLBACK: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
-          IN_BATCH: ${{ github.event.client_payload.batch_max_mb || github.event.inputs.batch_max_mb }}
         run: |
           set -euo pipefail
           SOURCE=$(printf '%s' "$IN_SOURCE" | tr -d '\r' | xargs)
           VERSION=$(printf '%s' "$IN_VERSION" | tr -d '\r' | xargs)
-          BATCH_MAX_MB=$(printf '%s' "${IN_BATCH:-5120}" | tr -d '\r' | xargs)
           [ -n "$SOURCE" ] || { echo "::error::缺少 source_name"; exit 1; }
           [ -n "$VERSION" ] || VERSION="main"
-          case "$BATCH_MAX_MB" in (*[!0-9]*|'') BATCH_MAX_MB=5120 ;; esac
 
           SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
           CATEGORY_DIR="${SOURCE##*/}"
@@ -67,12 +60,11 @@ jobs:
             echo "VERSION=$VERSION"
             echo "SAFE_NAME=$SAFE_NAME"
             echo "CATEGORY_DIR=$CATEGORY_DIR"
-            echo "BATCH_MAX_MB=$BATCH_MAX_MB"
             echo "PROFILE_ID=${IN_PROFILE:-hf_quark}"
             echo "TASK_ID=${IN_TASK:-manual_$(date +%s)}"
             echo "CALLBACK_URL=$IN_CALLBACK"
           } >> "$GITHUB_ENV"
-          echo "📋 $SOURCE @ $VERSION（每批上限 ${BATCH_MAX_MB} MB）"
+          echo "📋 $SOURCE @ $VERSION"
 
       - name: 2. 安装工具链
         run: |
@@ -119,17 +111,18 @@ jobs:
           TOTAL_BYTES=$(awk -F'\t' '{s+=$2} END{print s+0}' /tmp/hf_files.tsv)
           MAX_BYTES=$(awk -F'\t' 'BEGIN{m=0}{if($2>m)m=$2} END{print m+0}' /tmp/hf_files.tsv)
 
-          MARGIN_MB=1024
+          # 每批上限动态计算：本机可用磁盘 − 5GB 余量，向下取整到整 GB
+          MARGIN_MB=5120
           FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
           AVAIL_MB=$(( FREE_MB - MARGIN_MB )); [ "$AVAIL_MB" -lt 0 ] && AVAIL_MB=0
-          # 落盘上限 = min(每批上限, 本地可用空间)
-          STAGE_LIMIT_MB=$BATCH_MAX_MB
-          [ "$STAGE_LIMIT_MB" -gt "$AVAIL_MB" ] && STAGE_LIMIT_MB=$AVAIL_MB
+          STAGE_LIMIT_MB=$(( AVAIL_MB / 1024 * 1024 ))
 
           echo "📦 文件数 ${TOTAL_FILES} | 合计 $((TOTAL_BYTES/1024/1024)) MB | 最大单文件 $((MAX_BYTES/1024/1024)) MB"
-          echo "💽 本地可用 ${FREE_MB} MB（留 ${MARGIN_MB} MB 余量）→ 落盘上限 ${STAGE_LIMIT_MB} MB"
-          if [ "$MAX_BYTES" -gt $((STAGE_LIMIT_MB*1024*1024)) ]; then
-            echo "⚠️ 最大文件超过落盘上限，该文件将走流式直传（不落盘）"
+          echo "💽 本地可用 ${FREE_MB} MB（留 ${MARGIN_MB} MB = 5GB 余量）→ 每批上限 ${STAGE_LIMIT_MB} MB（$((STAGE_LIMIT_MB/1024)) GB）"
+          if [ "$STAGE_LIMIT_MB" -le 0 ]; then
+            echo "⚠️ 可用空间不足 5GB 余量，全部文件将走流式直传（不落盘）"
+          elif [ "$MAX_BYTES" -gt $((STAGE_LIMIT_MB*1024*1024)) ]; then
+            echo "⚠️ 最大文件超过每批上限，该文件将走流式直传（不落盘）"
           fi
 
           {
