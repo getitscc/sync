@@ -88,6 +88,8 @@ jobs:
             echo "PROFILE_ID=${IN_PROFILE:-hf_quark}"
             echo "TASK_ID=${IN_TASK:-manual_$(date +%s)}"
             echo "CALLBACK_URL=$IN_CALLBACK"
+            # 本轮 run 起始时间戳：第 6 步据它做时间预算判断（GitHub 单次 6 小时硬上限）
+            echo "SYNC_START_TS=$(date +%s)"
           } >> "$GITHUB_ENV"
           echo "📋 [$PROJECT_TYPE] $SOURCE @ $VERSION"
 
@@ -224,10 +226,12 @@ jobs:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
+          # 用 commit sha 固化 revision：跨次续跑时仓库若更新，仍下载同一份文件，避免新旧混存
+          REV="${CHECKSUM_VALUE:-$VERSION}"
           if [ -n "${RESOLVE_PREFIX:-}" ]; then
-            RESOLVE="https://huggingface.co/${RESOLVE_PREFIX}/${SOURCE}/resolve/${VERSION}"
+            RESOLVE="https://huggingface.co/${RESOLVE_PREFIX}/${SOURCE}/resolve/${REV}"
           else
-            RESOLVE="https://huggingface.co/${SOURCE}/resolve/${VERSION}"
+            RESOLVE="https://huggingface.co/${SOURCE}/resolve/${REV}"
           fi
           ROOT_ON_PAN="/pan${ROOT_FOLDER}/${CATEGORY_DIR}"
           STAGE_LIMIT_BYTES=$(( STAGE_LIMIT_MB * 1024 * 1024 ))
@@ -243,8 +247,6 @@ jobs:
               -d "$(jq -n --arg t "$TASK_ID" --arg e "$1" '{taskId:$t,status:"failed",error:$e}')" || true
             return 0
           }
-          trap 'notify_failed "HF 上传失败（脚本第 $LINENO 行）"' ERR
-
           notify() {   # $1=stage  $2=message
             [ -n "${CALLBACK_URL:-}" ] || return 0
             curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
@@ -252,6 +254,11 @@ jobs:
               -d "$(jq -n --arg t "$TASK_ID" --arg s "$1" --arg m "$2" \
                     '{taskId:$t, stage:$s, message:$m}')" || true
           }
+          # 长任务心跳：全程每 10 分钟上报一次，避免单个大文件长时间无声传输被后端
+          # 的「60 分钟无进展即释放」规则误判为失败
+          ( while true; do sleep 600; notify pulling "处理中（心跳）…"; done ) &
+          HB_PID=$!
+          trap 'kill "$HB_PID" 2>/dev/null || true; notify_failed "HF 上传失败（脚本第 $LINENO 行）"' ERR
           notify pulling "已获取文件清单：共 ${TOTAL_FILES} 个文件（$((TOTAL_BYTES/1024/1024)) MB），开始跨海拉取…"
 
           mkdir -p /tmp/hf_batch
@@ -266,6 +273,13 @@ jobs:
             CREATED_DIR[$dir]=1
           }
 
+          pan_size() {   # $1=网盘完整路径 → 已有文件的字节数；不存在或为目录则输出空
+            curl -sS -X POST "http://127.0.0.1:5244/api/fs/get" \
+              -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+              -d "$(jq -n --arg p "$1" '{path:$p}')" \
+              | jq -r '.data | select(. != null and .is_dir == false) | (.size // empty)' 2>/dev/null || true
+          }
+
           put_local() {   # $1=网盘路径  $2=本地文件
             curl -sS -f -X PUT "http://127.0.0.1:5244/api/fs/put" \
               -H "Authorization: $ALIST_TOKEN" \
@@ -273,7 +287,31 @@ jobs:
               -T "$2" > /dev/null
           }
 
-          part=0; done_files=0
+          # ---- 上传前先去重：网盘已有且体积一致的文件直接跳过 ----
+          # 体积不一致（上次传了一半 / 内容变更）一律视为残缺，保留重下。
+          # 这样多轮续跑时，只补没传完的文件，不会每次从头再来。
+          NEEDED=/tmp/hf_needed.tsv
+          : > "$NEEDED"
+          skipped=0
+          while IFS=$'\t' read -r p s; do
+            [ -n "$p" ] || continue
+            s=${s:-0}
+            have=$(pan_size "$ROOT_ON_PAN/$p")
+            if [ -n "$have" ] && [ "$have" = "$s" ]; then
+              skipped=$((skipped+1))
+            else
+              printf '%s\t%s\n' "$p" "$s" >> "$NEEDED"
+            fi
+          done < /tmp/hf_files.tsv
+          TODO_FILES=$(wc -l < "$NEEDED" | tr -d ' ')
+          echo "⏭️  网盘已存在且体积一致，跳过 ${skipped}/${TOTAL_FILES} 个文件；本次仍需处理 ${TODO_FILES} 个"
+          notify pulling "网盘已有 ${skipped}/${TOTAL_FILES} 个文件，本次只拉取剩余 ${TODO_FILES} 个"
+
+          part=0; done_files=$skipped
+          # GitHub 单次 run 6 小时硬上限：留 1 小时余量，到 5 小时即收尾，剩余交由续跑
+          START_TS=${SYNC_START_TS:-$(date +%s)}
+          TIME_BUDGET=${SYNC_TIME_BUDGET:-18000}
+          TIMED_OUT=0
           LAST_NOTIFY=0; NOTIFY_EVERY_FILES=5; NOTIFY_EVERY_SECS=10
           declare -a BATCH=(); batch_bytes=0
 
@@ -290,15 +328,21 @@ jobs:
 
           flush_batch() {
             [ "${#BATCH[@]}" -gt 0 ] || return 0
-            local p s tmp dest
+            local p s tmp dest ok
             echo "⬇️  下载第 $((part+1)) 批：${#BATCH[@]} 个文件，$((batch_bytes/1024/1024)) MB"
             notify pulling "正在跨海拉取第 $((part+1)) 批：${#BATCH[@]} 个文件（$((batch_bytes/1024/1024)) MB）"
             for entry in "${BATCH[@]}"; do
               p="${entry%%|*}"; s="${entry##*|}"
               [ "$s" -le "$STAGE_LIMIT_BYTES" ] || continue   # 超大文件留到上传阶段流式
               tmp="$(mktemp /tmp/hf_batch/part.XXXXXX)"
-              curl -sS -fL "${AUTH[@]}" -o "$tmp" "$RESOLVE/$p"
-              TMPFILE["$p"]="$tmp"
+              # --retry/--retry-all-errors 单文件自动重试；-C - 断点续传（同一轮内中途断了接着传）
+              if curl -sS -fL --retry 5 --retry-all-errors --retry-delay 3 -C - -o "$tmp" \
+                   "${AUTH[@]}" "$RESOLVE/$p"; then
+                TMPFILE["$p"]="$tmp"
+              else
+                echo "   ⚠️ 下载失败，留待下一轮续跑重试：$p"
+                rm -f "$tmp"
+              fi
             done
 
             echo "⬆️  上传第 $((part+1)) 批"
@@ -306,20 +350,29 @@ jobs:
               p="${entry%%|*}"; s="${entry##*|}"
               dest="$ROOT_ON_PAN/$p"
               mkdir_pan "$(dirname "$dest")"
+              ok=1
               if [ "$s" -gt "$STAGE_LIMIT_BYTES" ]; then
                 echo "   ↳ 流式直传（$((s/1024/1024)) MB）：$p"
                 notify pulling "正在跨海拉取（流式）：$p"
-                curl -sS -fL "${AUTH[@]}" "$RESOLVE/$p" | curl -sS -f -X PUT \
-                  -H "Authorization: $ALIST_TOKEN" \
-                  -H "File-Path: $dest" -H "As-Task: false" \
-                  -T - "http://127.0.0.1:5244/api/fs/put" > /dev/null
+                if curl -sS -fL "${AUTH[@]}" "$RESOLVE/$p" | curl -sS -f -X PUT \
+                     -H "Authorization: $ALIST_TOKEN" \
+                     -H "File-Path: $dest" -H "As-Task: false" \
+                     -T - "http://127.0.0.1:5244/api/fs/put" > /dev/null; then :; else ok=0; fi
               else
                 echo "   ↳ 上传：$p"
-                put_local "$dest" "${TMPFILE[$p]}"
-                rm -f "${TMPFILE[$p]}"; unset 'TMPFILE[$p]'
+                if [ -n "${TMPFILE[$p]:-}" ] && put_local "$dest" "${TMPFILE[$p]}"; then
+                  rm -f "${TMPFILE[$p]}"; unset 'TMPFILE[$p]'
+                else
+                  ok=0
+                fi
               fi
-              done_files=$((done_files+1))
-              progress "$p"
+              # 单个文件失败不终止整轮：不计数，下一轮按体积去重后只补这一个
+              if [ "$ok" = "1" ]; then
+                done_files=$((done_files+1))
+                progress "$p"
+              else
+                echo "   ⚠️ 上传失败，留待下一轮续跑重试：$p"
+              fi
             done
             BATCH=(); batch_bytes=0; part=$((part+1))
           }
@@ -327,6 +380,11 @@ jobs:
           while IFS=$'\t' read -r p s; do
             [ -n "$p" ] || continue
             s=${s:-0}
+            if [ "$TIMED_OUT" = "0" ] && [ $(( $(date +%s) - START_TS )) -gt "$TIME_BUDGET" ]; then
+              echo "⏳ 已达时间预算（$((TIME_BUDGET/3600)) 小时），本轮提前收尾，剩余文件留待自动续跑"
+              TIMED_OUT=1
+            fi
+            [ "$TIMED_OUT" = "0" ] || break
             if [ "$s" -gt "$STAGE_LIMIT_BYTES" ]; then
               flush_batch
               BATCH=("$p|$s"); batch_bytes="$s"; flush_batch
@@ -336,12 +394,27 @@ jobs:
               fi
               BATCH+=("$p|$s"); batch_bytes=$((batch_bytes + s))
             fi
-          done < /tmp/hf_files.tsv
-          flush_batch
+          done < "$NEEDED"
+          [ "$TIMED_OUT" = "1" ] || flush_batch
           rm -rf /tmp/hf_batch
-          echo "✅ 全部 ${done_files} 个文件已上传，共 ${part} 批"
+          kill "$HB_PID" 2>/dev/null || true
+
+          # 只有整批文件全部就绪才落库（回调 uploaded）；否则只报 partial，交由定时任务自动续跑
+          if [ "$done_files" -ge "$TOTAL_FILES" ]; then
+            echo "✅ 整批就绪：${TOTAL_FILES} 个文件全部在网盘（本轮新增 $((done_files-skipped)) 个，跳过 ${skipped} 个），共 ${part} 批"
+            echo "SYNC_COMPLETE=1" >> "$GITHUB_ENV"
+          else
+            REMAIN=$((TOTAL_FILES-done_files))
+            echo "⏸️  本轮完成 ${done_files}/${TOTAL_FILES} 个文件，剩余 ${REMAIN} 个留待自动续跑"
+            echo "SYNC_COMPLETE=0" >> "$GITHUB_ENV"
+            [ -n "${CALLBACK_URL:-}" ] && curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$(jq -n --arg t "$TASK_ID" --arg m "已写入 ${done_files}/${TOTAL_FILES} 个文件，剩余 ${REMAIN} 个留待自动续跑" \
+                    '{taskId:$t, stage:"partial", message:$m}')" || true
+          fi
 
       - name: 7. 取模型目录 fid
+        if: env.SYNC_COMPLETE == '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -358,6 +431,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: 8. 回调后端（上传完成）
+        if: env.SYNC_COMPLETE == '1'
         shell: bash
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
