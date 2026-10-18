@@ -1,0 +1,294 @@
+name: F-Droid Sync
+
+# 由后端 repository_dispatch 触发（event_type=download_fdroid），也可手动运行。
+# 直链模式：Worker 已从 F-Droid 官方 API 解析出 APK 直链与 sha256，本 workflow 只做
+# 「下载 → 强制 sha256 校验 → 领网盘凭证 → 挂载 → 上传 → 回调」，不再自行解析源站。
+
+on:
+  repository_dispatch:
+    types: [download_fdroid]
+  workflow_dispatch:
+    inputs:
+      source_name:
+        description: '应用包名（如 org.fdroid.fdroid）'
+        required: true
+        default: 'org.fdroid.fdroid'
+      version:
+        description: '版本号 versionCode'
+        required: false
+        default: ''
+      download_url:
+        description: 'APK 直链（由后端下发）'
+        required: false
+        default: ''
+      checksum_value:
+        description: 'sha256（由后端下发）'
+        required: false
+        default: ''
+      size_bytes:
+        description: '文件体积（由后端下发）'
+        required: false
+        default: ''
+      file_name:
+        description: 'APK 文件名（由后端下发）'
+        required: false
+        default: ''
+      profile_id:
+        description: '网盘账号 ID'
+        required: false
+        default: ''
+      task_id:
+        description: '任务 ID'
+        required: false
+        default: ''
+      callback_url:
+        description: '后端回调地址'
+        required: false
+        default: ''
+
+# 并发去重：同一任务重复派发时排队而非并发跑；不同任务互不影响
+concurrency:
+  group: sync-${{ github.event.client_payload.task_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 超时兜底：避免挂死长期占用 Actions 额度
+    timeout-minutes: 45
+    steps:
+      - name: 1. 参数解析与下载信息组装
+        id: params
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          IN_SOURCE: ${{ github.event.client_payload.source_name || github.event.inputs.source_name }}
+          IN_VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
+          IN_URL: ${{ github.event.client_payload.download_url || github.event.inputs.download_url }}
+          IN_SHA: ${{ github.event.client_payload.checksum_value || github.event.inputs.checksum_value }}
+          IN_SIZE: ${{ github.event.client_payload.size_bytes || github.event.inputs.size_bytes }}
+          IN_FILE: ${{ github.event.client_payload.file_name || github.event.inputs.file_name }}
+          IN_PROFILE: ${{ github.event.client_payload.profile_id || github.event.inputs.profile_id }}
+          IN_TASK: ${{ github.event.client_payload.task_id || github.event.inputs.task_id }}
+          IN_CALLBACK: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
+        run: |
+          set -euo pipefail
+          SOURCE=$(printf '%s' "$IN_SOURCE" | tr -d '\r' | xargs || true)
+          VERSION=$(printf '%s' "$IN_VERSION" | tr -d '\r' | xargs || true)
+          DOWNLOAD_URL=$(printf '%s' "$IN_URL" | tr -d '\r' | xargs || true)
+          CHECKSUM_VALUE=$(printf '%s' "$IN_SHA" | tr -d '\r' | xargs | tr 'A-Z' 'a-z' || true)
+          SIZE_BYTES=$(printf '%s' "$IN_SIZE" | tr -d '\r' | xargs || true)
+          FILE_NAME=$(printf '%s' "$IN_FILE" | tr -d '\r' | xargs || true)
+
+          [ -n "$SOURCE" ] || { echo "::error::缺少 source_name（应用包名）"; exit 1; }
+          [ -n "$DOWNLOAD_URL" ] || { echo "::error::缺少 download_url（APK 直链），请由 Worker 派发"; exit 1; }
+          [ -n "$CHECKSUM_VALUE" ] || { echo "::error::缺少 checksum_value（sha256），无法校验，拒绝执行"; exit 1; }
+          [ -n "$FILE_NAME" ] || FILE_NAME="${SOURCE}_${VERSION}.apk"
+
+          TASK_ID="${IN_TASK:-manual_$(date +%s)}"
+          CALLBACK_URL="$IN_CALLBACK"
+          PROFILE_ID="${IN_PROFILE:-fdroid_quark}"
+
+          {
+            echo "SOURCE=$SOURCE"
+            echo "VERSION=$VERSION"
+            echo "DOWNLOAD_URL=$DOWNLOAD_URL"
+            echo "CHECKSUM_VALUE=$CHECKSUM_VALUE"
+            echo "SIZE_BYTES=$SIZE_BYTES"
+            echo "FILE_NAME=$FILE_NAME"
+            echo "LOCAL_FILE=/tmp/$FILE_NAME"
+            echo "PROFILE_ID=$PROFILE_ID"
+            echo "TASK_ID=$TASK_ID"
+            echo "CALLBACK_URL=$CALLBACK_URL"
+          } >> "$GITHUB_ENV"
+          echo "📋 $SOURCE ($VERSION) → $FILE_NAME"
+
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"prepared\",\"message\":\"参数解析完成，准备拉取官方 APK\",\"projectType\":\"fdroid\"}" || true
+          fi
+
+      - name: 2. 下载官方 APK（断点续传 + 自动重试）
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在从 F-Droid 官方仓库拉取 $FILE_NAME…\",\"projectType\":\"fdroid\"}" || true
+          fi
+          curl -fL --retry 5 --retry-all-errors -C - --connect-timeout 20 \
+            -o "$LOCAL_FILE" "$DOWNLOAD_URL"
+          ACTUAL_SIZE=$(stat -c%s "$LOCAL_FILE")
+          echo "下载完成：$FILE_NAME（$(( ACTUAL_SIZE / 1024 )) KB）"
+
+      - name: 3. 强制 sha256 校验
+        run: |
+          set -euo pipefail
+          ACTUAL=$(sha256sum "$LOCAL_FILE" | awk '{print $1}')
+          if [ "$ACTUAL" != "$CHECKSUM_VALUE" ]; then
+            echo "::error::sha256 校验失败：期望 $CHECKSUM_VALUE，实际 $ACTUAL"
+            exit 1
+          fi
+          echo "✅ sha256 校验通过：$ACTUAL"
+          echo "SIZE_BYTES=$(stat -c%s "$LOCAL_FILE")" >> "$GITHUB_ENV"
+
+      - name: 4. 领取网盘凭证
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          CRED_URL="${CALLBACK_URL%/callback}/drive/credential?profile_id=${PROFILE_ID}"
+          CRED=$(curl -sS -f "$CRED_URL" -H "X-Callback-Secret: $CALLBACK_SECRET")
+          DRIVE_TYPE=$(echo "$CRED" | jq -r '.data.drive_type // empty')
+          COOKIE=$(echo "$CRED" | jq -r '.data.cookie // empty')
+          ROOT_FOLDER=$(echo "$CRED" | jq -r '.data.root_folder // empty')
+          ALIST_DRIVER=$(echo "$CRED" | jq -r '.data.alist_driver // empty')
+          if [ -z "$COOKIE" ]; then
+            echo "::error::领取网盘凭证失败：$(echo "$CRED" | jq -r '.message // "响应为空"')"
+            exit 1
+          fi
+          if [ -z "$ROOT_FOLDER" ]; then
+            ROOT_FOLDER="/fdroid"
+          fi
+          echo "::add-mask::$(printf '%s' "$COOKIE" | tr -d '\r\n')"
+          {
+            echo "DRIVE_TYPE=$DRIVE_TYPE"
+            echo "ROOT_FOLDER=$ROOT_FOLDER"
+            echo "ALIST_DRIVER=$ALIST_DRIVER"
+            echo "COOKIE<<__COOKIE_EOF__"
+            printf '%s\n' "$COOKIE"
+            echo "__COOKIE_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: 5. 启动 AList 并挂载网盘
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null
+          for _ in $(seq 1 60); do
+            curl -s http://127.0.0.1:5244/api/public/settings > /dev/null && break
+            sleep 1
+          done
+          docker exec alist_sync ./alist admin set 123456 > /dev/null
+          TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"123456"}' | jq -r '.data.token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::AList 登录失败"
+            exit 1
+          fi
+          echo "ALIST_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          case "$ALIST_DRIVER" in
+            Quark)        ADDITION=$(jq -n --arg c "$COOKIE" '{cookie:$c, root_folder_id:"0"}') ;;
+            BaiduNetdisk) ADDITION=$(jq -n --arg c "$COOKIE" '{cookie:$c, root_folder:"/"}') ;;
+            *)            ADDITION=$(jq -n --arg c "$COOKIE" '{cookie:$c}') ;;
+          esac
+
+          MOUNT=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create \
+            -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg mp "/pan" --arg d "$ALIST_DRIVER" --arg a "$ADDITION" \
+                  '{mount_path:$mp, order:0, remark:"temp", driver:$d, addition:$a}')")
+          CODE=$(echo "$MOUNT" | jq -r '.code // 500')
+          if [ "$CODE" != "200" ]; then
+            echo "::error::网盘挂载失败（$ALIST_DRIVER）：$(echo "$MOUNT" | jq -r '.message // "未知"')"
+            exit 1
+          fi
+
+      - name: 6. 上传并取文件 ID
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          SAFE_PKG=$(printf '%s' "$SOURCE" | tr '/\\' '--')
+          DEST_DIR="/pan${ROOT_FOLDER}/${SAFE_PKG}"
+          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p}')" > /dev/null
+
+          # 同包名先删旧文件，避免不同版本堆叠
+          curl -s -X POST http://127.0.0.1:5244/api/fs/remove \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg d "$DEST_DIR" --arg n "$FILE_NAME" '{dir:$d, names:[$n]}')" > /dev/null || true
+
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$(jq -n --arg t "$TASK_ID" --arg m \
+                    "正在上传 $FILE_NAME（$(( ${SIZE_BYTES:-0} / 1024 / 1024 )) MB）" \
+                    '{taskId:$t, stage:"uploading", message:$m, projectType:"fdroid"}')" || true
+          fi
+
+          echo "📤 上传中：$FILE_NAME"
+          curl -sS -X PUT \
+            -H "Authorization: $ALIST_TOKEN" \
+            -H "File-Path: ${DEST_DIR}/${FILE_NAME}" \
+            -H "As-Task: false" \
+            -T "$LOCAL_FILE" \
+            "http://127.0.0.1:5244/api/fs/put" > upload_res.json
+          UPLOAD_CODE=$(jq -r '.code // 500' upload_res.json)
+          if [ "$UPLOAD_CODE" != "200" ]; then
+            echo "::error::上传失败：$(jq -r '.message // "未知"' upload_res.json)"
+            exit 1
+          fi
+
+          LIST=$(curl -s -X POST http://127.0.0.1:5244/api/fs/list \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg p "$DEST_DIR" '{path:$p, page:1, per_page:50}')")
+          FID=$(echo "$LIST" | jq -r --arg fn "$FILE_NAME" \
+            '.data.content[] | select(.name == $fn) | (.provider_id // .id // .fid // .raw.id) | select(. != null)' | head -n 1)
+          echo "🔑 文件 ID: ${FID:-（未取到）}"
+          {
+            echo "DRIVE_FID=$FID"
+            echo "PAN_PATH=${ROOT_FOLDER}/${SAFE_PKG}/${FILE_NAME}"
+          } >> "$GITHUB_ENV"
+
+      - name: 7. 回调后端（上传完成）
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          PAYLOAD=$(jq -n \
+            --arg taskId "$TASK_ID" \
+            --arg projectType "fdroid" \
+            --arg sourceName "$SOURCE" \
+            --arg version "$VERSION" \
+            --arg arch "" \
+            --arg checksumAlgo "sha256" \
+            --arg checksumValue "$CHECKSUM_VALUE" \
+            --arg packFormat "raw" \
+            --argjson sizeBytes "${SIZE_BYTES:-0}" \
+            --arg driveFid "${DRIVE_FID:-}" \
+            --arg panPath "${PAN_PATH:-}" \
+            --arg panFileName "$FILE_NAME" \
+            --arg driveType "${DRIVE_TYPE:-}" \
+            '{taskId:$taskId, status:"uploaded", projectType:$projectType,
+              sourceName:$sourceName, version:$version, arch:$arch,
+              checksumAlgo:$checksumAlgo, checksumValue:$checksumValue,
+              packFormat:$packFormat, sizeBytes:$sizeBytes,
+              driveFid:$driveFid, panPath:$panPath, panFileName:$panFileName,
+              driveType:$driveType}')
+          curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CALLBACK_SECRET" \
+            -d "$PAYLOAD" || true
+
+      - name: 8. 失败回传（兜底）
+        if: failure()
+        shell: bash
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          [ -n "${CALLBACK_URL:-}" ] || exit 0
+          HINT="${FAIL_HINT:-后台任务失败：F-Droid APK 下载或校验中断，请查看 Actions 日志}"
+          curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
+            -d "$(jq -n --arg t "${TASK_ID:-manual}" --arg e "$HINT" '{taskId:$t,status:"failed",error:$e}')" || true

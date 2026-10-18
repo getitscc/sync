@@ -42,9 +42,16 @@ on:
         required: false
         default: ''
 
+# 并发去重：同一任务重复派发时排队而非并发跑；不同任务互不影响
+concurrency:
+  group: sync-${{ github.event.client_payload.task_id || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # 超时兜底：避免挂死长期占用 Actions 额度
+    timeout-minutes: 45
     steps:
       - name: 1. 参数解析
         env:
