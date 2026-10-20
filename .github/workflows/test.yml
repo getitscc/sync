@@ -11,7 +11,7 @@ name: Docker Sync
 
 on:
   repository_dispatch:
-    types: [download_docker]
+    types: [xxxxdocker]
   workflow_dispatch:
     inputs:
       source_name:
