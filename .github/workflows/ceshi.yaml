@@ -1,0 +1,47 @@
+name: Test Manifest Digest Alpine
+on:
+  workflow_dispatch:
+jobs:
+  test-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install skopeo & jq
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y skopeo jq -qq
+
+      - name: Get digest for alpine:latest linux/amd64
+        run: |
+          set -euo pipefail
+          FULL_IMAGE="docker.io/library/alpine:latest"
+          ARCH_OS="linux"
+          ARCH_NAME="amd64"
+          ARCH_VARIANT=""
+
+          PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
+          [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
+
+          RAW_MANIFEST=$(skopeo inspect --raw "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
+          MEDIA_TYPE=$(echo "$RAW_MANIFEST" | jq -r '.mediaType // empty' 2>/dev/null || true)
+          DIGEST=""
+
+          echo "=== RAW mediaType ==="
+          echo "$MEDIA_TYPE"
+
+          if [ "$MEDIA_TYPE" = "application/vnd.docker.distribution.manifest.list.v2+json" ] || [ "$MEDIA_TYPE" = "application/vnd.oci.image.index.v1+json" ]; then
+            DIGEST=$(echo "$RAW_MANIFEST" | jq -r \
+              --arg os "$ARCH_OS" --arg arch "$ARCH_NAME" --arg variant "$ARCH_VARIANT" \
+              '.manifests[] | select(.platform.os == $os) | select(.platform.architecture == $arch) | select($variant == "" or (.platform.variant // "") == $variant) | .digest' \
+              2>/dev/null | head -n 1 || true)
+          fi
+
+          # 单架构镜像 fallback
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            DIGEST=$(skopeo inspect "${PLATFORM[@]}" --format '{{.Digest}}' "docker://${FULL_IMAGE}" 2>/dev/null || echo "")
+          fi
+
+          echo "======================================"
+          echo "FULL_IMAGE: $FULL_IMAGE"
+          echo "PLATFORM: $ARCH_OS/$ARCH_NAME"
+          echo "Manifest Digest: $DIGEST"
+          echo "======================================"
