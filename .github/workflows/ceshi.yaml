@@ -59,8 +59,9 @@ jobs:
           # load导入
           docker load < "${TAR_RAW}"
 
-          # 获取导入后本地镜像digest
-          LOCAL_DIGEST_A=$(docker inspect --format '{{.RepoDigests}}' "${IMAGE}" | jq -r '.[0] | split("@")[1]')
+          # 获取镜像ID，读取manifest digest
+          IMG_ID=$(docker images --filter=reference="${IMAGE}" --quiet | head -1)
+          LOCAL_DIGEST_A=$(docker inspect --format '{{.Id}}' "${IMG_ID}")
           echo "====================场景A【未压缩tar导入】本地digest===================="
           echo "${LOCAL_DIGEST_A}"
           echo "LOCAL_DIGEST_A=${LOCAL_DIGEST_A}" >> $GITHUB_ENV
@@ -86,8 +87,9 @@ jobs:
           # 解压管道导入
           gunzip -c "${TAR_GZ}" | docker load
 
-          # 获取导入后本地镜像digest
-          LOCAL_DIGEST_B=$(docker inspect --format '{{.RepoDigests}}' "${IMAGE}" | jq -r '.[0] | split("@")[1]')
+          # 获取镜像ID，读取manifest digest
+          IMG_ID=$(docker images --filter=reference="${IMAGE}" --quiet | head -1)
+          LOCAL_DIGEST_B=$(docker inspect --format '{{.Id}}' "${IMG_ID}")
           echo "====================场景B【gzip压缩包导入】本地digest===================="
           echo "${LOCAL_DIGEST_B}"
           echo "LOCAL_DIGEST_B=${LOCAL_DIGEST_B}" >> $GITHUB_ENV
@@ -99,7 +101,7 @@ jobs:
           echo "场景A 裸tar导入后digest:     ${{ env.LOCAL_DIGEST_A }}"
           echo "场景B gzip压缩导入后digest:  ${{ env.LOCAL_DIGEST_B }}"
           echo ""
-          if [[ "${env.REMOTE_DIGEST}" == "${env.LOCAL_DIGEST_A}" && "${env.REMOTE_DIGEST}" == "${env.LOCAL_DIGEST_B}" ]]; then
+          if [[ "${REMOTE_DIGEST}" == "${LOCAL_DIGEST_A}" && "${REMOTE_DIGEST}" == "${LOCAL_DIGEST_B}" ]]; then
             echo "✅ 全部Digest一致！压缩与否不改变镜像Manifest digest"
           else
             echo "❌ Digest不匹配！"
