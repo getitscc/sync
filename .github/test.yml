@@ -1,0 +1,178 @@
+name: Verify Digest Chain
+
+# 验证专用工作流（手动触发）：
+# 按修正版方案（skopeo → OCI 布局、官方索引原样入包）拉取两个指定镜像，
+# 在 runner 上验完整条 digest 链（大号 index digest + 平台 digest + 每个 blob 小号），
+# 并把成品 tar 上传为 Artifact —— 下载到本地 Docker Desktop 上 docker load，
+# 看 docker images --digests 的 DIGEST 是否等于日志里的官方 index digest，即最终验收。
+#
+# 用法：把本文件放到仓库 .github/workflows/ 下，
+#       Actions → Verify Digest Chain → Run workflow。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: docker.io/library/alpine:20260805
+            os: linux
+            arch: amd64
+            variant: ""
+            slug: alpine-20260805-amd64
+          - image: docker.io/library/nginx:trixie-perl
+            os: linux
+            arch: "386"
+            variant: ""
+            slug: nginx-trixie-perl-386
+    name: verify ${{ matrix.slug }}
+    steps:
+      - name: 1. 安装工具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo jq
+
+      - name: 2. 取官方索引与 digest（对照基准）
+        run: |
+          set -euo pipefail
+          IMG="${{ matrix.image }}"
+          # 索引原文（官方字节，一字节不动）
+          skopeo inspect --raw "docker://${IMG}" > index.raw
+          IDX_DIGEST="sha256:$(sha256sum index.raw | awk '{print $1}')"
+          # 与 skopeo inspect 的 {{.Digest}} 交叉校验（两种算法必须一致）
+          INSPECT_DIGEST="$(skopeo inspect --format '{{.Digest}}' "docker://${IMG}")"
+          echo "官方 index digest（按原文算）: ${IDX_DIGEST}"
+          echo "官方 index digest（inspect） : ${INSPECT_DIGEST}"
+          [ "${IDX_DIGEST}" = "${INSPECT_DIGEST}" ] || { echo "::error::索引 digest 两种算法不一致"; exit 1; }
+          # 平台 manifest digest：从索引里按 os/arch/variant 挑，跳过 attestation 条目
+          PLAT_DIGEST="$(jq -r \
+            --arg os "${{ matrix.os }}" --arg arch "${{ matrix.arch }}" --arg variant "${{ matrix.variant }}" '
+            def plat: (.platform // {});
+            def isatt: (plat.os // "") == "unknown" and (plat.architecture // "") == "unknown";
+            [.manifests[]? | select(isatt | not)
+             | select((plat.os // $os) == $os)
+             | select((plat.architecture // "") == $arch)
+             | select($variant == "" or (plat.variant // "") == $variant or (plat.variant == null))
+            ][0].digest // empty' index.raw)"
+          if [ -z "${PLAT_DIGEST}" ]; then
+            # 单架构镜像：raw 本身就是 manifest，平台 digest 即索引 digest
+            PLAT_DIGEST="${IDX_DIGEST}"
+            echo "单架构镜像：平台 digest = 索引 digest"
+          fi
+          echo "官方平台 digest: ${PLAT_DIGEST}"
+          {
+            echo "IDX_DIGEST=${IDX_DIGEST}"
+            echo "PLAT_DIGEST=${PLAT_DIGEST}"
+          } >> "$GITHUB_ENV"
+
+      - name: 3. skopeo 拉取为 OCI 布局（修正版打包法）
+        run: |
+          set -euo pipefail
+          IMG="${{ matrix.image }}"
+          PLATFORM=(--override-os "${{ matrix.os }}" --override-arch "${{ matrix.arch }}")
+          [ -n "${{ matrix.variant }}" ] && PLATFORM+=(--override-variant "${{ matrix.variant }}")
+          LAYOUT="${RUNNER_TEMP}/layout"
+          skopeo copy "${PLATFORM[@]}" "docker://${IMG}" "oci:${LAYOUT}:${IMG}"
+          # 官方索引原样复制进 blobs（字节不许动）
+          cp index.raw "${LAYOUT}/blobs/sha256/${IDX_DIGEST#sha256:}"
+          # 平台 manifest 必须已被 skopeo 拉进布局
+          [ -f "${LAYOUT}/blobs/sha256/${PLAT_DIGEST#sha256:}" ] || { echo "::error::布局内缺少平台 manifest"; exit 1; }
+          # 外层 index.json 指向官方索引（用户导入端据此建立 RepoDigests）
+          MEDIA_TYPE="$(jq -r '.mediaType' index.raw)"
+          TAG="${IMG##*:}"
+          jq -n --arg dgst "${IDX_DIGEST}" --argjson size "$(stat -c%s index.raw)" \
+                --arg mt "${MEDIA_TYPE}" --arg name "${IMG}" --arg ref "${TAG}" \
+            '{schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json",
+              manifests: [{mediaType: $mt, digest: $dgst, size: $size,
+                           annotations: {"org.opencontainers.image.ref.name": $ref,
+                                         "io.containerd.image.name": $name}}]}' \
+            > "${LAYOUT}/index.json"
+          printf '{"imageLayoutVersion": "1.0.0"}' > "${LAYOUT}/oci-layout"
+          # 未压缩 tar 输出
+          TAR_OUT="${RUNNER_TEMP}/${{ matrix.slug }}.tar"
+          tar -C "${LAYOUT}" -cf "${TAR_OUT}" $(ls -A "${LAYOUT}")
+          {
+            echo "TAR_OUT=${TAR_OUT}"
+            echo "IMG_TAG=${TAG}"
+          } >> "$GITHUB_ENV"
+          ls -lh "${TAR_OUT}"
+
+      - name: 4. 验链（大号 + 平台号 + 小号全验）
+        run: |
+          set -euo pipefail
+          FAIL=0
+          CHK="$(mktemp -d)"
+          tar -C "${CHK}" -xf "${TAR_OUT}"
+
+          echo "== ① index.json 指向官方索引 =="
+          REF="$(jq -r '.manifests[0].digest' "${CHK}/index.json")"
+          if [ "${REF}" = "${IDX_DIGEST}" ]; then echo "✓ 指向 ${IDX_DIGEST}"; else echo "✗ 指向 ${REF}"; FAIL=1; fi
+
+          echo "== ② 索引 blob 本身未被改动 =="
+          H="sha256:$(sha256sum "${CHK}/blobs/sha256/${IDX_DIGEST#sha256:}" | awk '{print $1}')"
+          if [ "${H}" = "${IDX_DIGEST}" ]; then echo "✓ 索引 blob sha256 与官方一致"; else echo "✗ 索引 blob 被改动"; FAIL=1; fi
+
+          echo "== ③ 平台 manifest 在包内且未被改动 =="
+          PM="${CHK}/blobs/sha256/${PLAT_DIGEST#sha256:}"
+          if [ -f "${PM}" ] && [ "sha256:$(sha256sum "${PM}" | awk '{print $1}')" = "${PLAT_DIGEST}" ]; then
+            echo "✓ 平台 manifest sha256 = ${PLAT_DIGEST}"
+          else echo "✗ 平台 manifest 缺失或被改动"; FAIL=1; fi
+
+          echo "== ④ 平台 manifest 引用的 config + 全部层都在包内 =="
+          if [ -f "${PM}" ]; then
+            for d in $(jq -r '.config.digest, (.layers[]?.digest)' "${PM}"); do
+              [ -f "${CHK}/blobs/sha256/${d#sha256:}" ] || { echo "✗ 缺少 blob ${d}"; FAIL=1; }
+            done
+            echo "✓ 引用完整"
+          fi
+
+          echo "== ⑤ 小号全验：每个 blob 的 sha256 必须等于它的文件名 =="
+          N=0; BAD=0
+          for f in "${CHK}"/blobs/sha256/*; do
+            N=$((N+1))
+            h="$(sha256sum "${f}" | awk '{print $1}')"
+            [ "${h}" = "$(basename "${f}")" ] || { echo "✗ blob ${f##*/} 内容与文件名不符"; BAD=$((BAD+1)); }
+          done
+          echo "共 ${N} 个 blob，不符 ${BAD} 个"
+          [ "${BAD}" -eq 0 ] || FAIL=1
+
+          echo "== ⑥ skopeo 按「索引 → 平台 manifest」路径可读性 =="
+          PLATFORM=(--override-os "${{ matrix.os }}" --override-arch "${{ matrix.arch }}")
+          [ -n "${{ matrix.variant }}" ] && PLATFORM+=(--override-variant "${{ matrix.variant }}")
+          if skopeo inspect "${PLATFORM[@]}" "oci:${CHK}:${IMG_TAG}" > /dev/null; then
+            echo "✓ 布局可读"
+          else echo "✗ 布局不可读"; FAIL=1; fi
+
+          echo "=================================================="
+          if [ "${FAIL}" -eq 0 ]; then
+            echo "✅ 验链全过：${{ matrix.image }} (${{ matrix.os }}/${{ matrix.arch }})"
+            echo "   官方 index digest : ${IDX_DIGEST}"
+            echo "   官方平台 digest   : ${PLAT_DIGEST}"
+            echo "   本地 Docker Desktop load 后，DIGEST 应 = 上面的 index digest"
+          else
+            echo "❌ 验链未过，见上方 ✗"
+            exit 1
+          fi
+          rm -rf "${CHK}"
+
+      - name: 5. docker load 参考验证（仅记录，不判失败）
+        continue-on-error: true
+        run: |
+          set +e
+          echo "runner docker 存储驱动：$(docker info --format '{{.Driver}}' 2>/dev/null)"
+          docker load -i "${TAR_OUT}"
+          echo "load 退出码：$?"
+          docker images --digests
+          echo "（runner 多为经典存储，load 报 blobs/json 属环境差异；最终以本地下载 Artifact 后 load 为准）"
+
+      - name: 6. 上传成品包（Artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.slug }}
+          path: ${{ env.TAR_OUT }}
+          retention-days: 7
