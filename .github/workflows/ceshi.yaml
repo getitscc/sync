@@ -1,19 +1,21 @@
-name: Test Manifest Digest Alpine
+name: docker-save-load-digest-compare
 on:
   workflow_dispatch:
 jobs:
-  test-digest:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Install skopeo & jq
+      - name: 安装依赖 skopeo jq
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y skopeo jq -qq
+          sudo apt-get install -y skopeo jq gzip -qq
 
-      - name: Get digest for alpine:latest linux/amd64
+      - name: 配置参数 & 获取远端原始Manifest digest（linux/amd64）
+        id: remote_digest
         run: |
           set -euo pipefail
-          FULL_IMAGE="docker.io/library/alpine:latest"
+          IMAGE="alpine:latest"
+          FULL_IMAGE="docker.io/library/${IMAGE}"
           ARCH_OS="linux"
           ARCH_NAME="amd64"
           ARCH_VARIANT=""
@@ -21,27 +23,85 @@ jobs:
           PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
           [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
 
-          RAW_MANIFEST=$(skopeo inspect --raw "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
-          MEDIA_TYPE=$(echo "$RAW_MANIFEST" | jq -r '.mediaType // empty' 2>/dev/null || true)
-          DIGEST=""
-
-          echo "=== RAW mediaType ==="
-          echo "$MEDIA_TYPE"
+          RAW_MANIFEST=$(skopeo inspect --raw "docker://${FULL_IMAGE}")
+          MEDIA_TYPE=$(echo "$RAW_MANIFEST" | jq -r '.mediaType')
+          REMOTE_DIGEST=""
 
           if [ "$MEDIA_TYPE" = "application/vnd.docker.distribution.manifest.list.v2+json" ] || [ "$MEDIA_TYPE" = "application/vnd.oci.image.index.v1+json" ]; then
-            DIGEST=$(echo "$RAW_MANIFEST" | jq -r \
+            REMOTE_DIGEST=$(echo "$RAW_MANIFEST" | jq -r \
               --arg os "$ARCH_OS" --arg arch "$ARCH_NAME" --arg variant "$ARCH_VARIANT" \
               '.manifests[] | select(.platform.os == $os) | select(.platform.architecture == $arch) | select($variant == "" or (.platform.variant // "") == $variant) | .digest' \
-              2>/dev/null | head -n 1 || true)
+              | head -n1)
+          fi
+          if [ -z "$REMOTE_DIGEST" ] || [ "$REMOTE_DIGEST" = "null" ]; then
+            REMOTE_DIGEST=$(skopeo inspect "${PLATFORM[@]}" --format '{{.Digest}}' "docker://${FULL_IMAGE}")
           fi
 
-          # 单架构镜像 fallback
-          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
-            DIGEST=$(skopeo inspect "${PLATFORM[@]}" --format '{{.Digest}}' "docker://${FULL_IMAGE}" 2>/dev/null || echo "")
-          fi
+          echo "IMAGE=${IMAGE}" >> $GITHUB_ENV
+          echo "REMOTE_DIGEST=${REMOTE_DIGEST}" >> $GITHUB_ENV
+          echo "====================远端原始Manifest Digest===================="
+          echo "${REMOTE_DIGEST}"
 
-          echo "======================================"
-          echo "FULL_IMAGE: $FULL_IMAGE"
-          echo "PLATFORM: $ARCH_OS/$ARCH_NAME"
-          echo "Manifest Digest: $DIGEST"
-          echo "======================================"
+      - name: 【场景A】docker save 导出未压缩tar → docker load，读取导入后digest
+        run: |
+          set -euo pipefail
+          IMAGE="${{ env.IMAGE }}"
+          TAR_RAW="/tmp/alpine-raw.tar"
+
+          # 导出标准tar
+          docker save -o "${TAR_RAW}" "${IMAGE}"
+          echo "✅ 导出裸tar文件: ${TAR_RAW}"
+          ls -lh "${TAR_RAW}"
+
+          # 删除本地镜像，保证是全新load
+          docker rmi "${IMAGE}" || true
+
+          # load导入
+          docker load < "${TAR_RAW}"
+
+          # 获取导入后本地镜像digest
+          LOCAL_DIGEST_A=$(docker inspect --format '{{.RepoDigests}}' "${IMAGE}" | jq -r '.[0] | split("@")[1]')
+          echo "====================场景A【未压缩tar导入】本地digest===================="
+          echo "${LOCAL_DIGEST_A}"
+          echo "LOCAL_DIGEST_A=${LOCAL_DIGEST_A}" >> $GITHUB_ENV
+
+      - name: 清理镜像，准备场景B
+        run: |
+          docker rmi alpine:latest || true
+
+      - name: 【场景B】docker save管道gzip压缩导出，管道docker load，读取digest
+        run: |
+          set -euo pipefail
+          IMAGE="${{ env.IMAGE }}"
+          TAR_GZ="/tmp/alpine.tar.gz"
+
+          # docker save 直接管道gzip压缩保存
+          docker save "${IMAGE}" | gzip -9 --no-name > "${TAR_GZ}"
+          echo "✅ 导出压缩包: ${TAR_GZ}"
+          ls -lh "${TAR_GZ}"
+
+          # 删除镜像
+          docker rmi "${IMAGE}" || true
+
+          # 解压管道导入
+          gunzip -c "${TAR_GZ}" | docker load
+
+          # 获取导入后本地镜像digest
+          LOCAL_DIGEST_B=$(docker inspect --format '{{.RepoDigests}}' "${IMAGE}" | jq -r '.[0] | split("@")[1]')
+          echo "====================场景B【gzip压缩包导入】本地digest===================="
+          echo "${LOCAL_DIGEST_B}"
+          echo "LOCAL_DIGEST_B=${LOCAL_DIGEST_B}" >> $GITHUB_ENV
+
+      - name: 汇总对比
+        run: |
+          echo "====================汇总对比===================="
+          echo "远端原始manifest digest:     ${{ env.REMOTE_DIGEST }}"
+          echo "场景A 裸tar导入后digest:     ${{ env.LOCAL_DIGEST_A }}"
+          echo "场景B gzip压缩导入后digest:  ${{ env.LOCAL_DIGEST_B }}"
+          echo ""
+          if [[ "${env.REMOTE_DIGEST}" == "${env.LOCAL_DIGEST_A}" && "${env.REMOTE_DIGEST}" == "${env.LOCAL_DIGEST_B}" ]]; then
+            echo "✅ 全部Digest一致！压缩与否不改变镜像Manifest digest"
+          else
+            echo "❌ Digest不匹配！"
+            exit 1
+          fi
