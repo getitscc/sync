@@ -1,21 +1,25 @@
-name: Verify Digest Chain
+name: Digest Full Check
 
-# 验证专用工作流（手动触发）：
-# 按修正版方案（skopeo → OCI 布局、官方索引原样入包）拉取两个指定镜像，
-# 在 runner 上验完整条 digest 链（大号 index digest + 平台 digest + 每个 blob 小号），
-# 并把成品 tar 上传为 Artifact —— 下载到本地 Docker Desktop 上 docker load，
-# 看 docker images --digests 的 DIGEST 是否等于日志里的官方 index digest，即最终验收。
+# 一站式验证工作流（手动触发）：同一个镜像、六种口径，实测各自的
+# Manifest digest 与文件大小，在运行摘要页（Step Summary）出对比表。
+#   1. 官方（Docker Hub 上的 index digest 与平台压缩体积）
+#   2. skopeo 打包 docker-archive + pigz（现行线上方式）
+#   3. skopeo 打包 OCI 布局（skopeo 默认索引）
+#   4. OCI + 官方索引原样入包（修正版方案）
+#   5. 最终未压缩 tar（从成品文件回读 index.json）
+#   6. 导入后查询（把 runner 的 Docker 切到 containerd 存储后 docker load，
+#      再查 docker images --digests 的 DIGEST —— 与用户在 Docker Desktop 上看到的一致）
 #
-# 用法：把本文件放到仓库 .github/workflows/ 下，
-#       Actions → Verify Digest Chain → Run workflow。
+# 用法：放到仓库 .github/workflows/ 下，Actions → Digest Full Check → Run workflow，
+#       跑完点进运行记录，摘要区即有两张对比表。
 
 on:
   workflow_dispatch:
 
 jobs:
-  verify:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -24,34 +28,33 @@ jobs:
             os: linux
             arch: amd64
             variant: ""
-            slug: alpine-20260805-amd64
           - image: docker.io/library/nginx:trixie-perl
             os: linux
             arch: "386"
             variant: ""
-            slug: nginx-trixie-perl-386
-    name: verify ${{ matrix.slug }}
+    name: check ${{ matrix.image }} (${{ matrix.os }}/${{ matrix.arch }})
     steps:
-      - name: 1. 安装工具
+      - name: 0. 安装工具并拼平台参数
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq skopeo jq
+          sudo apt-get install -y -qq skopeo jq pigz
+          {
+            echo "P_OS=${{ matrix.os }}"
+            echo "P_ARCH=${{ matrix.arch }}"
+            echo "P_VARIANT=${{ matrix.variant }}"
+            echo "IMG=${{ matrix.image }}"
+          } >> "$GITHUB_ENV"
 
-      - name: 2. 取官方索引与 digest（对照基准）
+      - name: 1. 官方（Docker Hub）
         run: |
           set -euo pipefail
-          IMG="${{ matrix.image }}"
-          # 索引原文（官方字节，一字节不动）
+          # 索引原文与 index digest（两种算法交叉校验）
           skopeo inspect --raw "docker://${IMG}" > index.raw
-          IDX_DIGEST="sha256:$(sha256sum index.raw | awk '{print $1}')"
-          # 与 skopeo inspect 的 {{.Digest}} 交叉校验（两种算法必须一致）
-          INSPECT_DIGEST="$(skopeo inspect --format '{{.Digest}}' "docker://${IMG}")"
-          echo "官方 index digest（按原文算）: ${IDX_DIGEST}"
-          echo "官方 index digest（inspect） : ${INSPECT_DIGEST}"
-          [ "${IDX_DIGEST}" = "${INSPECT_DIGEST}" ] || { echo "::error::索引 digest 两种算法不一致"; exit 1; }
-          # 平台 manifest digest：从索引里按 os/arch/variant 挑，跳过 attestation 条目
-          PLAT_DIGEST="$(jq -r \
-            --arg os "${{ matrix.os }}" --arg arch "${{ matrix.arch }}" --arg variant "${{ matrix.variant }}" '
+          IDX="sha256:$(sha256sum index.raw | awk '{print $1}')"
+          INSPECT="$(skopeo inspect --format '{{.Digest}}' "docker://${IMG}")"
+          [ "${IDX}" = "${INSPECT}" ] || { echo "::error::index digest 交叉校验失败"; exit 1; }
+          # 平台 manifest digest（跳过 attestation 条目）
+          PLAT="$(jq -r --arg os "$P_OS" --arg arch "$P_ARCH" --arg variant "$P_VARIANT" '
             def plat: (.platform // {});
             def isatt: (plat.os // "") == "unknown" and (plat.architecture // "") == "unknown";
             [.manifests[]? | select(isatt | not)
@@ -59,120 +62,144 @@ jobs:
              | select((plat.architecture // "") == $arch)
              | select($variant == "" or (plat.variant // "") == $variant or (plat.variant == null))
             ][0].digest // empty' index.raw)"
-          if [ -z "${PLAT_DIGEST}" ]; then
-            # 单架构镜像：raw 本身就是 manifest，平台 digest 即索引 digest
-            PLAT_DIGEST="${IDX_DIGEST}"
-            echo "单架构镜像：平台 digest = 索引 digest"
-          fi
-          echo "官方平台 digest: ${PLAT_DIGEST}"
+          [ -n "${PLAT}" ] || PLAT="${IDX}"
+          # 平台 manifest 原文 → 官方平台压缩体积（层 + config）
+          REPO="${IMG%:*}"
+          skopeo inspect --raw "docker://${REPO}@${PLAT}" > plat.raw
+          PSIZE="$(jq -r '[(.layers[]?.size // 0), (.config.size // 0)] | add' plat.raw)"
           {
-            echo "IDX_DIGEST=${IDX_DIGEST}"
-            echo "PLAT_DIGEST=${PLAT_DIGEST}"
+            echo "D_OFFICIAL=${IDX}"
+            echo "S_OFFICIAL=${PSIZE}"
+            echo "PLAT_DIGEST=${PLAT}"
           } >> "$GITHUB_ENV"
+          echo "官方 index digest: ${IDX}"
+          echo "官方平台 digest  : ${PLAT}"
+          echo "官方平台压缩体积 : ${PSIZE} B"
 
-      - name: 3. skopeo 拉取为 OCI 布局（修正版打包法）
+      - name: 2. skopeo docker-archive + pigz（现行线上方式）
         run: |
           set -euo pipefail
-          IMG="${{ matrix.image }}"
-          PLATFORM=(--override-os "${{ matrix.os }}" --override-arch "${{ matrix.arch }}")
-          [ -n "${{ matrix.variant }}" ] && PLATFORM+=(--override-variant "${{ matrix.variant }}")
+          PLATFORM=(--override-os "$P_OS" --override-arch "$P_ARCH")
+          [ -n "$P_VARIANT" ] && PLATFORM+=(--override-variant "$P_VARIANT")
+          F="${RUNNER_TEMP}/da.tar"
+          skopeo copy "${PLATFORM[@]}" "docker://${IMG}" "docker-archive:${F}:${IMG}"
+          # docker-archive 不携带 manifest digest 关联；load 后 DIGEST 列显示的是 config 的号。
+          # 从包里把 config 抠出来算它的 sha256，即用户实际看到的那个数。
+          X="$(mktemp -d)"
+          tar -C "${X}" -xf "${F}" manifest.json
+          CFG="$(jq -r '.[0].Config' "${X}/manifest.json")"
+          tar -C "${X}" -xf "${F}" "${CFG}"
+          CFG_DIGEST="sha256:$(sha256sum "${X}/${CFG}" | awk '{print $1}')"
+          # 与现行工作流一致：pigz -9 后改名回 .tar
+          pigz -9 -p 4 "${F}"
+          mv "${F}.gz" "${F}"
+          {
+            echo "D_DA=${CFG_DIGEST}"
+            echo "S_DA=$(stat -c%s "${F}")"
+          } >> "$GITHUB_ENV"
+          echo "docker-archive 包内 config digest（load 后冒充 DIGEST 的数）: ${CFG_DIGEST}"
+          echo "成品大小: $(stat -c%s "${F}") B"
+
+      - name: 3. skopeo OCI 布局（默认索引）
+        run: |
+          set -euo pipefail
+          PLATFORM=(--override-os "$P_OS" --override-arch "$P_ARCH")
+          [ -n "$P_VARIANT" ] && PLATFORM+=(--override-variant "$P_VARIANT")
           LAYOUT="${RUNNER_TEMP}/layout"
           skopeo copy "${PLATFORM[@]}" "docker://${IMG}" "oci:${LAYOUT}:${IMG}"
-          # 官方索引原样复制进 blobs（字节不许动）
-          cp index.raw "${LAYOUT}/blobs/sha256/${IDX_DIGEST#sha256:}"
-          # 平台 manifest 必须已被 skopeo 拉进布局
+          D_OCI="$(jq -r '.manifests[0].digest' "${LAYOUT}/index.json")"
+          T3="${RUNNER_TEMP}/oci-default.tar"
+          tar -C "${LAYOUT}" -cf "${T3}" $(ls -A "${LAYOUT}")
+          {
+            echo "D_OCI=${D_OCI}"
+            echo "S_OCI=$(stat -c%s "${T3}")"
+            echo "LAYOUT=${LAYOUT}"
+          } >> "$GITHUB_ENV"
+          echo "skopeo 默认 index.json 指向: ${D_OCI}（平台 manifest 的号）"
+          echo "未压缩 tar 大小: $(stat -c%s "${T3}") B"
+
+      - name: 4. OCI + 官方索引原样入包（修正版方案）
+        run: |
+          set -euo pipefail
+          # 官方索引原文复制进 blobs（字节不动）
+          cp index.raw "${LAYOUT}/blobs/sha256/${D_OFFICIAL#sha256:}"
           [ -f "${LAYOUT}/blobs/sha256/${PLAT_DIGEST#sha256:}" ] || { echo "::error::布局内缺少平台 manifest"; exit 1; }
-          # 外层 index.json 指向官方索引（用户导入端据此建立 RepoDigests）
-          MEDIA_TYPE="$(jq -r '.mediaType' index.raw)"
+          MT="$(jq -r '.mediaType' index.raw)"
           TAG="${IMG##*:}"
-          jq -n --arg dgst "${IDX_DIGEST}" --argjson size "$(stat -c%s index.raw)" \
-                --arg mt "${MEDIA_TYPE}" --arg name "${IMG}" --arg ref "${TAG}" \
+          jq -n --arg dgst "${D_OFFICIAL}" --argjson size "$(stat -c%s index.raw)" \
+                --arg mt "${MT}" --arg name "${IMG}" --arg ref "${TAG}" \
             '{schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json",
               manifests: [{mediaType: $mt, digest: $dgst, size: $size,
                            annotations: {"org.opencontainers.image.ref.name": $ref,
                                          "io.containerd.image.name": $name}}]}' \
             > "${LAYOUT}/index.json"
           printf '{"imageLayoutVersion": "1.0.0"}' > "${LAYOUT}/oci-layout"
-          # 未压缩 tar 输出
-          TAR_OUT="${RUNNER_TEMP}/${{ matrix.slug }}.tar"
-          tar -C "${LAYOUT}" -cf "${TAR_OUT}" $(ls -A "${LAYOUT}")
+          D_INJ="$(jq -r '.manifests[0].digest' "${LAYOUT}/index.json")"
+          T4="${RUNNER_TEMP}/final.tar"
+          tar -C "${LAYOUT}" -cf "${T4}" $(ls -A "${LAYOUT}")
           {
-            echo "TAR_OUT=${TAR_OUT}"
-            echo "IMG_TAG=${TAG}"
+            echo "D_INJ=${D_INJ}"
+            echo "S_INJ=$(stat -c%s "${T4}")"
+            echo "FINAL_TAR=${T4}"
           } >> "$GITHUB_ENV"
-          ls -lh "${TAR_OUT}"
+          echo "入包后 index.json 指向: ${D_INJ}"
+          echo "未压缩 tar 大小: $(stat -c%s "${T4}") B"
 
-      - name: 4. 验链（大号 + 平台号 + 小号全验）
+      - name: 5. 最终未压缩 tar（从成品文件回读）
         run: |
           set -euo pipefail
-          FAIL=0
-          CHK="$(mktemp -d)"
-          tar -C "${CHK}" -xf "${TAR_OUT}"
+          X="$(mktemp -d)"
+          tar -C "${X}" -xf "${FINAL_TAR}" index.json
+          D_TAR="$(jq -r '.manifests[0].digest' "${X}/index.json")"
+          {
+            echo "D_TAR=${D_TAR}"
+            echo "S_TAR=$(stat -c%s "${FINAL_TAR}")"
+          } >> "$GITHUB_ENV"
+          echo "成品 tar 内 index.json 指向: ${D_TAR}"
+          echo "成品 tar 大小: $(stat -c%s "${FINAL_TAR}") B"
 
-          echo "== ① index.json 指向官方索引 =="
-          REF="$(jq -r '.manifests[0].digest' "${CHK}/index.json")"
-          if [ "${REF}" = "${IDX_DIGEST}" ]; then echo "✓ 指向 ${IDX_DIGEST}"; else echo "✗ 指向 ${REF}"; FAIL=1; fi
-
-          echo "== ② 索引 blob 本身未被改动 =="
-          H="sha256:$(sha256sum "${CHK}/blobs/sha256/${IDX_DIGEST#sha256:}" | awk '{print $1}')"
-          if [ "${H}" = "${IDX_DIGEST}" ]; then echo "✓ 索引 blob sha256 与官方一致"; else echo "✗ 索引 blob 被改动"; FAIL=1; fi
-
-          echo "== ③ 平台 manifest 在包内且未被改动 =="
-          PM="${CHK}/blobs/sha256/${PLAT_DIGEST#sha256:}"
-          if [ -f "${PM}" ] && [ "sha256:$(sha256sum "${PM}" | awk '{print $1}')" = "${PLAT_DIGEST}" ]; then
-            echo "✓ 平台 manifest sha256 = ${PLAT_DIGEST}"
-          else echo "✗ 平台 manifest 缺失或被改动"; FAIL=1; fi
-
-          echo "== ④ 平台 manifest 引用的 config + 全部层都在包内 =="
-          if [ -f "${PM}" ]; then
-            for d in $(jq -r '.config.digest, (.layers[]?.digest)' "${PM}"); do
-              [ -f "${CHK}/blobs/sha256/${d#sha256:}" ] || { echo "✗ 缺少 blob ${d}"; FAIL=1; }
-            done
-            echo "✓ 引用完整"
-          fi
-
-          echo "== ⑤ 小号全验：每个 blob 的 sha256 必须等于它的文件名 =="
-          N=0; BAD=0
-          for f in "${CHK}"/blobs/sha256/*; do
-            N=$((N+1))
-            h="$(sha256sum "${f}" | awk '{print $1}')"
-            [ "${h}" = "$(basename "${f}")" ] || { echo "✗ blob ${f##*/} 内容与文件名不符"; BAD=$((BAD+1)); }
-          done
-          echo "共 ${N} 个 blob，不符 ${BAD} 个"
-          [ "${BAD}" -eq 0 ] || FAIL=1
-
-          echo "== ⑥ skopeo 按「索引 → 平台 manifest」路径可读性 =="
-          PLATFORM=(--override-os "${{ matrix.os }}" --override-arch "${{ matrix.arch }}")
-          [ -n "${{ matrix.variant }}" ] && PLATFORM+=(--override-variant "${{ matrix.variant }}")
-          if skopeo inspect "${PLATFORM[@]}" "oci:${CHK}:${IMG_TAG}" > /dev/null; then
-            echo "✓ 布局可读"
-          else echo "✗ 布局不可读"; FAIL=1; fi
-
-          echo "=================================================="
-          if [ "${FAIL}" -eq 0 ]; then
-            echo "✅ 验链全过：${{ matrix.image }} (${{ matrix.os }}/${{ matrix.arch }})"
-            echo "   官方 index digest : ${IDX_DIGEST}"
-            echo "   官方平台 digest   : ${PLAT_DIGEST}"
-            echo "   本地 Docker Desktop load 后，DIGEST 应 = 上面的 index digest"
-          else
-            echo "❌ 验链未过，见上方 ✗"
-            exit 1
-          fi
-          rm -rf "${CHK}"
-
-      - name: 5. docker load 参考验证（仅记录，不判失败）
-        continue-on-error: true
+      - name: 6. 导入后查询（containerd 存储下 docker load 后查 DIGEST）
         run: |
-          set +e
-          echo "runner docker 存储驱动：$(docker info --format '{{.Driver}}' 2>/dev/null)"
-          docker load -i "${TAR_OUT}"
-          echo "load 退出码：$?"
-          docker images --digests
-          echo "（runner 多为经典存储，load 报 blobs/json 属环境差异；最终以本地下载 Artifact 后 load 为准）"
+          set -euo pipefail
+          # runner 的 Docker 默认经典存储，读不了 OCI 包（报 blobs/json）；
+          # 切到 containerd 存储（与 Docker Desktop 相同）再导入，查到的数据才与用户端一致。
+          if [ -f /etc/docker/daemon.json ]; then
+            sudo jq '.features["containerd-snapshotter"] = true' /etc/docker/daemon.json > /tmp/daemon.json
+            sudo mv /tmp/daemon.json /etc/docker/daemon.json
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' | sudo tee /etc/docker/daemon.json > /dev/null
+          fi
+          sudo systemctl restart docker || sudo service docker restart
+          for i in $(seq 1 30); do docker info > /dev/null 2>&1 && break; sleep 2; done
+          echo "docker 存储驱动: $(docker info --format '{{.Driver}}')"
+          if docker load -i "${FINAL_TAR}"; then
+            docker images --digests
+            TAG="${IMG##*:}"
+            D_LOAD="$(docker images --digests --format '{{.Tag}} {{.Digest}}' | awk -v t="${TAG}" '$1==t {print $2}' | head -n 1)"
+            [ -n "${D_LOAD}" ] || D_LOAD="$(docker images --digests --format '{{.Digest}}' | head -n 1)"
+          else
+            D_LOAD="导入失败（见本步日志）"
+          fi
+          echo "D_LOAD=${D_LOAD}" >> "$GITHUB_ENV"
+          echo "导入后查询到的 DIGEST: ${D_LOAD}"
 
-      - name: 6. 上传成品包（Artifact）
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.slug }}
-          path: ${{ env.TAR_OUT }}
-          retention-days: 7
+      - name: 7. 对比表（写入运行摘要）
+        if: always()
+        run: |
+          fmt() { echo "$1 B（约 $(numfmt --to=iec --suffix=B "$1")）"; }
+          {
+            echo "### ${IMG} — ${P_OS}/${P_ARCH}"
+            echo ""
+            echo "| 阶段 | Manifest digest | 文件大小 |"
+            echo "|---|---|---|"
+            echo "| 1. 官方（Docker Hub） | \`${D_OFFICIAL:-未取得}\` | $(fmt "${S_OFFICIAL:-0}")，平台压缩体积 |"
+            echo "| 2. skopeo docker-archive + pigz（现行） | \`${D_DA:-未取得}\`（config 的号，非官方 manifest） | $(fmt "${S_DA:-0}") |"
+            echo "| 3. skopeo OCI（默认索引） | \`${D_OCI:-未取得}\`（平台 manifest 的号） | $(fmt "${S_OCI:-0}") |"
+            echo "| 4. OCI + 官方索引原样入包 | \`${D_INJ:-未取得}\` | $(fmt "${S_INJ:-0}") |"
+            echo "| 5. 最终未压缩 tar（回读） | \`${D_TAR:-未取得}\` | $(fmt "${S_TAR:-0}") |"
+            echo "| 6. 导入后查询（docker images --digests） | \`${D_LOAD:-未取得}\` | — |"
+            echo ""
+            echo "平台 digest（服务端校验用）：\`${PLAT_DIGEST:-未取得}\`"
+            echo ""
+            echo "判读：第 4、5、6 行的 digest 与第 1 行一致 = 全链路通过，用户 load 后看到的号与官方一致；第 2 行是 config 的号、第 3 行是平台的号，与第 1 行不同属口径不同/关联丢失。"
+          } >> "$GITHUB_STEP_SUMMARY"
