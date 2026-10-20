@@ -33,16 +33,9 @@ on:
         required: false
         default: ''
 
-# 并发去重：同一任务重复派发时排队而非并发跑；不同任务互不影响
-concurrency:
-  group: sync-${{ github.event.client_payload.task_id || github.run_id }}
-  cancel-in-progress: false
-
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # 超时兜底：避免挂死长期占用 Actions 额度
-    timeout-minutes: 45
     steps:
       - name: 1. 参数解析与镜像引用拼装
         id: params
@@ -136,7 +129,7 @@ jobs:
             sudo apt-get clean
           fi
 
-      - name: 4. 拉取并压缩
+      - name: 4. 拉取并打包（官方 OCI 布局）
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
@@ -167,11 +160,13 @@ jobs:
           PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
           [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
 
+          WORK="$(mktemp -d)"
+          LAYOUT="${WORK}/layout"
           LOCAL_TAR="/tmp/${PAN_FILE_NAME}"
-          skopeo copy "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
-          # pigz 会产出 .tar.gz，再改回 .tar 命名（内容仍是 gzip，与旧文件命名保持一致）
-          pigz -9 -p 4 "$LOCAL_TAR"
-          mv "${LOCAL_TAR}.gz" "$LOCAL_TAR"
+
+          # 打包成官方 OCI 布局：blobs/sha256/* 落官方原样字节（压缩层 + config + 平台 manifest），
+          # 不做二次压缩/解压，包内内容摘要与上游保持一致。
+          skopeo copy "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "oci:${LAYOUT}:${FULL_IMAGE}"
 
           # 平台 manifest digest：必须与服务端 platform_digest 算法完全一致，否则回调时会
           # 被判「校验值不一致」。注意 skopeo inspect 的 {{.Digest}} 在多架构镜像下返回的是
@@ -194,13 +189,100 @@ jobs:
             echo "::error::无法解析镜像 ${FULL_IMAGE} 在 ${ARCH} 下的 digest"
             exit 1
           fi
-          SIZE_BYTES=$(stat -c%s "/tmp/${PAN_FILE_NAME}")
+          # 官方 tag 索引（多架构即 manifest list / OCI index）原样字节入包，并让外层 index.json
+          # 指向它：docker load 之后 `docker images --digests` 的 DIGEST 就是官方 tag 索引 digest，
+          # 与网页卡片展示的值完全一致（不再被导入端重算成 791bfb4e 这类只在本机存在的值）。
+          skopeo inspect --raw "docker://${FULL_IMAGE}" > "${WORK}/index.raw"
+          IDX_DIGEST="sha256:$(sha256sum "${WORK}/index.raw" | awk '{print $1}')"
+          IDX_MEDIA="$(jq -r '.mediaType // "application/vnd.oci.image.index.v1+json"' "${WORK}/index.raw")"
+          IDX_SIZE="$(stat -c%s "${WORK}/index.raw")"
+          REG_DIGEST="$(skopeo inspect --format '{{.Digest}}' "docker://${FULL_IMAGE}" 2>/dev/null || echo "")"
+          if [ -n "$REG_DIGEST" ] && [ "$REG_DIGEST" != "$IDX_DIGEST" ]; then
+            echo "::error::索引 digest 与注册表回报不一致：raw=${IDX_DIGEST} registry=${REG_DIGEST}"
+            exit 1
+          fi
+          cp "${WORK}/index.raw" "${LAYOUT}/blobs/sha256/${IDX_DIGEST#sha256:}"
+
+          # 平台 manifest 原样字节一并入包，并确认与服务端口径一致
+          skopeo inspect "${PLATFORM[@]}" --raw "docker://${FULL_IMAGE}" > "${WORK}/platform.raw"
+          PLAT_DIGEST="sha256:$(sha256sum "${WORK}/platform.raw" | awk '{print $1}')"
+          if [ "$PLAT_DIGEST" != "$DIGEST" ]; then
+            echo "::error::平台 manifest digest 不一致：raw=${PLAT_DIGEST} 解析=${DIGEST}"
+            exit 1
+          fi
+          cp "${WORK}/platform.raw" "${LAYOUT}/blobs/sha256/${PLAT_DIGEST#sha256:}"
+
+          printf '{"imageLayoutVersion":"1.0.0"}\n' > "${LAYOUT}/oci-layout"
+          jq -n --arg mt "$IDX_MEDIA" --arg d "$IDX_DIGEST" --argjson s "$IDX_SIZE" \
+            --arg name "${FULL_IMAGE}" --arg ref "${FULL_IMAGE##*:}" \
+            '{schemaVersion:2, mediaType:"application/vnd.oci.image.index.v1+json",
+              manifests:[{mediaType:$mt, digest:$d, size:$s,
+                annotations:{"org.opencontainers.image.ref.name":$ref,"io.containerd.image.name":$name}}]}' \
+            > "${LAYOUT}/index.json"
+
+          tar -C "${LAYOUT}" -cf "${LOCAL_TAR}" $(ls -A "${LAYOUT}")
+          # pigz 会产出 .tar.gz，再改回 .tar 命名（内容仍是 gzip，与旧文件命名保持一致）
+          pigz -9 -p 4 "$LOCAL_TAR"
+          mv "${LOCAL_TAR}.gz" "$LOCAL_TAR"
+
+          SIZE_BYTES=$(stat -c%s "${LOCAL_TAR}")
           {
-            echo "LOCAL_FILE=/tmp/${PAN_FILE_NAME}"
+            echo "LOCAL_FILE=${LOCAL_TAR}"
             echo "CHECKSUM_VALUE=$DIGEST"
+            echo "IMAGE_INDEX_DIGEST=$IDX_DIGEST"
             echo "SIZE_BYTES=$SIZE_BYTES"
           } >> "$GITHUB_ENV"
-          echo "digest=$DIGEST size=${SIZE_BYTES}B"
+          echo "platformDigest=${DIGEST} indexDigest=${IDX_DIGEST} size=${SIZE_BYTES}B"
+          rm -rf "${WORK}"
+
+      - name: 4.5 包体与导入自检（不通过即中止）
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECK_DIR="$(mktemp -d)"
+          tar -C "${CHECK_DIR}" -xf "${LOCAL_FILE}"
+
+          [ -f "${CHECK_DIR}/oci-layout" ] || { echo "::error::包内缺少 oci-layout"; exit 1; }
+          [ -f "${CHECK_DIR}/index.json" ] || { echo "::error::包内缺少 index.json"; exit 1; }
+
+          REF_DIGEST="$(jq -r '.manifests[0].digest' "${CHECK_DIR}/index.json")"
+          REF_SIZE="$(jq -r '.manifests[0].size' "${CHECK_DIR}/index.json")"
+          if [ "${REF_DIGEST}" != "${IMAGE_INDEX_DIGEST}" ]; then
+            echo "::error::index.json 指向 ${REF_DIGEST}，与官方索引 ${IMAGE_INDEX_DIGEST} 不符"; exit 1
+          fi
+
+          IDX_BLOB="${CHECK_DIR}/blobs/sha256/${REF_DIGEST#sha256:}"
+          [ -f "${IDX_BLOB}" ] || { echo "::error::包内缺少官方索引 blob ${REF_DIGEST}"; exit 1; }
+          [ "$(stat -c%s "${IDX_BLOB}")" = "${REF_SIZE}" ] || { echo "::error::索引 blob 大小与声明不符"; exit 1; }
+          [ "sha256:$(sha256sum "${IDX_BLOB}" | awk '{print $1}')" = "${REF_DIGEST}" ] || {
+            echo "::error::索引 blob 内容摘要与声明不符"; exit 1; }
+
+          MAN_BLOB="${CHECK_DIR}/blobs/sha256/${CHECKSUM_VALUE#sha256:}"
+          [ -f "${MAN_BLOB}" ] || { echo "::error::包内缺少平台 manifest ${CHECKSUM_VALUE}"; exit 1; }
+          MISSING=""
+          for d in $(jq -r '.config.digest, (.layers[]?.digest)' "${MAN_BLOB}"); do
+            [ -f "${CHECK_DIR}/blobs/sha256/${d#sha256:}" ] || MISSING="${MISSING} ${d}"
+          done
+          if [ -n "${MISSING}" ]; then
+            echo "::error::官方清单引用的 blob 不在包内（多为打包端重新压缩所致）：${MISSING}"; exit 1
+          fi
+          echo "包体自检通过：index=${IMAGE_INDEX_DIGEST} platform=${CHECKSUM_VALUE} size=$(stat -c%s "${LOCAL_FILE}")B"
+
+          # 导入自检：runner 用的是经典存储，这一步顺带验证「老式 graphdriver 能否读本包」。
+          # load 失败即中止（坏包不会传上）；能 load 但 digest 不同只告警。
+          if docker info >/dev/null 2>&1; then
+            docker load -i "${LOCAL_FILE}"
+            if docker images -a --digests --format '{{.Digest}}' | grep -qF "${IMAGE_INDEX_DIGEST}"; then
+              echo "docker load 后 DIGEST=${IMAGE_INDEX_DIGEST}，与网页展示一致"
+            else
+              echo "::warning::docker load 成功但未见 ${IMAGE_INDEX_DIGEST}，实际列表如下："
+              docker images -a --digests
+            fi
+            docker system prune -af >/dev/null 2>&1 || true
+          else
+            echo "::warning::runner 无可用 docker，跳过导入自检"
+          fi
+          rm -rf "${CHECK_DIR}"
 
       - name: 5. 领取网盘凭证
         shell: bash
