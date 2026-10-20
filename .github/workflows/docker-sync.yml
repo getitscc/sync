@@ -203,14 +203,13 @@ jobs:
           fi
           cp "${WORK}/index.raw" "${LAYOUT}/blobs/sha256/${IDX_DIGEST#sha256:}"
 
-          # 平台 manifest 原样字节一并入包，并确认与服务端口径一致
-          skopeo inspect "${PLATFORM[@]}" --raw "docker://${FULL_IMAGE}" > "${WORK}/platform.raw"
-          PLAT_DIGEST="sha256:$(sha256sum "${WORK}/platform.raw" | awk '{print $1}')"
-          if [ "$PLAT_DIGEST" != "$DIGEST" ]; then
-            echo "::error::平台 manifest digest 不一致：raw=${PLAT_DIGEST} 解析=${DIGEST}"
-            exit 1
-          fi
-          cp "${WORK}/platform.raw" "${LAYOUT}/blobs/sha256/${PLAT_DIGEST#sha256:}"
+          # 平台 manifest 的 blob 已由 skopeo copy 以 registry 原始字节（真实 digest）落进布局，
+          # 这里只确认它确实在。不再用 skopeo inspect 重新抓取 + 本地重算 sha256：inspect --raw
+          # 返回的字节与 registry 存储字节不一定相同，会造成 raw 与索引声明的平台 digest 天然
+          # 不等而误报（且 skopeo 1.13 不认 --override-os/--override-arch）。CHECKSUM_VALUE 仍是
+          # 索引里声明的平台 digest，与服务端交叉校验口径不变。
+          [ -f "${LAYOUT}/blobs/sha256/${DIGEST#sha256:}" ] || {
+            echo "::error::skopeo copy 未产出平台 manifest blob ${DIGEST}"; exit 1; }
 
           printf '{"imageLayoutVersion":"1.0.0"}\n' > "${LAYOUT}/oci-layout"
           jq -n --arg mt "$IDX_MEDIA" --arg d "$IDX_DIGEST" --argjson s "$IDX_SIZE" \
