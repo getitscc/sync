@@ -114,39 +114,15 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq skopeo curl jq pigz
 
-      - name: 3. 磁盘按需清理
-        run: |
-          set -euo pipefail
-          RAW=$(skopeo inspect --raw "docker://${FULL_IMAGE}" || echo '{}')
-          SIZE=$(echo "$RAW" | jq -r '[.layers[].size] | add // 0' 2>/dev/null || echo 0)
-          EST_MB=$(( SIZE * 3 / 1024 / 1024 ))
-          FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
-          echo "预估 tar: ~${EST_MB}MB | 可用: ${FREE_MB}MB"
-          if [ "$EST_MB" -ge 10240 ] || [ $((FREE_MB - EST_MB)) -lt 5120 ]; then
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                        /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-                        /usr/local/share/powershell /usr/share/swift
-            sudo apt-get clean
-          fi
-
-      - name: 4. 拉取并压缩
+      - name: 3. 磁盘按需清理与工作目录准备
         env:
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
           NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # 阶段回调：开始拉取
-          if [ -n "$CALLBACK_URL" ]; then
-            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
-              -H "Content-Type: application/json" \
-              -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在跨海拉取并压缩镜像…\",\"projectType\":\"docker\"}" || true
-          fi
-
-          # 各 registry 的登录（都配了才登；公开镜像不需要）
+          # 提前登录，确保私有或受限镜像也能正常 inspect 体积
           if [[ "$FULL_IMAGE" == ghcr.io/* ]] && [ -n "${GHCR_TOKEN:-}" ]; then
             echo "$GHCR_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
           fi
@@ -160,10 +136,66 @@ jobs:
           PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
           [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
 
-          LOCAL_TAR="/tmp/${PAN_FILE_NAME}"
-          skopeo copy "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
-          # pigz 会产出 .tar.gz，再改回 .tar 命名（内容仍是 gzip，与旧文件命名保持一致）
-          pigz -9 -p 4 "$LOCAL_TAR"
+          # 不加 --raw，让 skopeo 自动解析多架构索引并提取对应平台的 LayersData
+          INFO=$(skopeo inspect "${PLATFORM[@]}" "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
+          SIZE=$(echo "$INFO" | jq -r '[.LayersData[]?.Size // 0] | add // 0' 2>/dev/null || echo 0)
+
+          # 预估峰值占用：未压缩 tar + pigz 压缩过程双份占用
+          EST_MB=$(( SIZE * 3 / 1024 / 1024 ))
+          FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
+          echo "压缩层总大小: $((SIZE / 1024 / 1024))MB | 预估峰值需求: ~${EST_MB}MB | 根分区可用: ${FREE_MB}MB"
+
+          # 当预估峰值超过 8GB、无法获取体积（SIZE=0）或剩余空间紧张时，清理 Runner 预装大件
+          if [ "$EST_MB" -ge 8192 ] || [ "$SIZE" -eq 0 ] || [ $((FREE_MB - EST_MB)) -lt 10240 ]; then
+            echo "🧹 正在清理 Runner 预装软件以释放空间..."
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                        /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                        /usr/local/share/powershell /usr/share/swift \
+                        /opt/az /usr/share/miniconda
+            sudo apt-get clean
+            echo "清理后根分区可用: $(df -m / | awk 'NR==2 {print $4}')MB"
+          fi
+
+          # 选择可用空间最大的分区（对比 /mnt 与 /），规避 /tmp 的分区大小或 Quota 限制
+          MNT_FREE=$(df -m /mnt 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
+          ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
+          if [ "$MNT_FREE" -gt "$ROOT_FREE" ]; then
+            WORK_DIR="/mnt/docker_work"
+          else
+            WORK_DIR="${RUNNER_TEMP:-/home/runner/work/_temp}/docker_work"
+          fi
+          sudo mkdir -p "$WORK_DIR" "$WORK_DIR/tmp"
+          sudo chmod -R 777 "$WORK_DIR"
+          {
+            echo "WORK_DIR=$WORK_DIR"
+            echo "TMPDIR=$WORK_DIR/tmp"
+          } >> "$GITHUB_ENV"
+          echo "📂 使用工作目录: $WORK_DIR"
+
+      - name: 4. 拉取并压缩
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          # 阶段回调：开始拉取
+          if [ -n "$CALLBACK_URL" ]; then
+            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在跨海拉取并压缩镜像…\",\"projectType\":\"docker\"}" || true
+          fi
+
+          PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
+          [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
+
+          LOCAL_TAR="${WORK_DIR}/${PAN_FILE_NAME}"
+          skopeo copy --tmpdir "$TMPDIR" "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
+
+          # 立即清空 skopeo 临时缓存，为接下来的 pigz 压缩腾出最大磁盘空间
+          rm -rf "${TMPDIR:?}"/*
+
+          # pigz 会产出 .tar.gz，再改回 .tar 命名（用 -6 兼顾高压缩率与速度，避免 -9 极慢）
+          pigz -6 -p 4 "$LOCAL_TAR"
           mv "${LOCAL_TAR}.gz" "$LOCAL_TAR"
 
           # 平台 manifest digest：必须与服务端 platform_digest 算法完全一致，否则回调时会
@@ -187,9 +219,9 @@ jobs:
             echo "::error::无法解析镜像 ${FULL_IMAGE} 在 ${ARCH} 下的 digest"
             exit 1
           fi
-          SIZE_BYTES=$(stat -c%s "/tmp/${PAN_FILE_NAME}")
+          SIZE_BYTES=$(stat -c%s "$LOCAL_TAR")
           {
-            echo "LOCAL_FILE=/tmp/${PAN_FILE_NAME}"
+            echo "LOCAL_FILE=$LOCAL_TAR"
             echo "CHECKSUM_VALUE=$DIGEST"
             echo "SIZE_BYTES=$SIZE_BYTES"
           } >> "$GITHUB_ENV"
@@ -305,6 +337,9 @@ jobs:
             echo "::error::上传失败：$(jq -r '.message // "未知"' upload_res.json)"
             exit 1
           fi
+
+          # 上传成功后立刻删除本地超大 tar 包，防止后续步骤磁盘紧张
+          rm -f "$LOCAL_FILE"
 
           LIST=$(curl -s -X POST http://127.0.0.1:5244/api/fs/list \
             -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
