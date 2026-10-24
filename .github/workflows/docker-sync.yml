@@ -140,14 +140,24 @@ jobs:
           INFO=$(skopeo inspect "${PLATFORM[@]}" "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
           SIZE=$(echo "$INFO" | jq -r '[.LayersData[]?.Size // 0] | add // 0' 2>/dev/null || echo 0)
 
+          # 选择可用空间最大的分区（对比 /mnt 与 /），规避 /tmp 的分区大小或 Quota 限制
+          MNT_FREE=$(df -m /mnt 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
+          ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
+          if [ "$MNT_FREE" -gt "$ROOT_FREE" ]; then
+            WORK_DIR="/mnt/docker_work"
+            WORK_FREE="$MNT_FREE"
+          else
+            WORK_DIR="${RUNNER_TEMP:-/home/runner/work/_temp}/docker_work"
+            WORK_FREE="$ROOT_FREE"
+          fi
+
           # 预估峰值占用：未压缩 tar + pigz 压缩过程双份占用
           EST_MB=$(( SIZE * 3 / 1024 / 1024 ))
-          FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
-          echo "压缩层总大小: $((SIZE / 1024 / 1024))MB | 预估峰值需求: ~${EST_MB}MB | 根分区可用: ${FREE_MB}MB"
+          echo "压缩层总大小: $((SIZE / 1024 / 1024))MB | 预估峰值需求: ~${EST_MB}MB | 可用: ${WORK_FREE}MB"
 
-          # 当预估峰值超过 8GB、无法获取体积（SIZE=0）或剩余空间紧张时，清理 Runner 预装大件
-          if [ "$EST_MB" -ge 8192 ] || [ "$SIZE" -eq 0 ] || [ $((FREE_MB - EST_MB)) -lt 10240 ]; then
-            echo "🧹 正在清理 Runner 预装软件以释放空间..."
+          # 仅当扣除预估峰值后剩余安全空间不足 5GB (5120MB) 或无法获取镜像体积 (SIZE=0) 时才触发清理
+          if [ $((WORK_FREE - EST_MB)) -lt 5120 ] || [ "$SIZE" -eq 0 ]; then
+            echo "🧹 预计剩余安全空间不足 5GB（或无法预估体积），正在清理 Runner 预装软件..."
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                         /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
                         /usr/local/share/powershell /usr/share/swift \
@@ -156,14 +166,6 @@ jobs:
             echo "清理后根分区可用: $(df -m / | awk 'NR==2 {print $4}')MB"
           fi
 
-          # 选择可用空间最大的分区（对比 /mnt 与 /），规避 /tmp 的分区大小或 Quota 限制
-          MNT_FREE=$(df -m /mnt 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
-          ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
-          if [ "$MNT_FREE" -gt "$ROOT_FREE" ]; then
-            WORK_DIR="/mnt/docker_work"
-          else
-            WORK_DIR="${RUNNER_TEMP:-/home/runner/work/_temp}/docker_work"
-          fi
           sudo mkdir -p "$WORK_DIR" "$WORK_DIR/tmp"
           sudo chmod -R 777 "$WORK_DIR"
           {
