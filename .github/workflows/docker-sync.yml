@@ -114,20 +114,75 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq skopeo curl jq pigz
 
-      - name: 3. 磁盘按需清理
+      - name: 3. 磁盘按需清理（含工作目录选择）
         run: |
           set -euo pipefail
-          RAW=$(skopeo inspect --raw "docker://${FULL_IMAGE}" || echo '{}')
-          SIZE=$(echo "$RAW" | jq -r '[.layers[].size] | add // 0' 2>/dev/null || echo 0)
-          EST_MB=$(( SIZE * 3 / 1024 / 1024 ))
-          FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
-          echo "预估 tar: ~${EST_MB}MB | 可用: ${FREE_MB}MB"
-          if [ "$EST_MB" -ge 10240 ] || [ $((FREE_MB - EST_MB)) -lt 5120 ]; then
+
+          # 多架构镜像的 inspect --raw 返回的是 manifest index，顶层没有 .layers，
+          # 直接取会得到 0（曾导致跳过清理、到压缩阶段才因空间不足失败）。
+          # 这里先挑出本平台子 manifest，再统计它的层体积（压缩后大小）。
+          pick_platform_digest() {
+            jq -r --arg os "$ARCH_OS" --arg arch "$ARCH_NAME" --arg variant "$ARCH_VARIANT" \
+              '.manifests[]? | select(.platform.os == $os) | select(.platform.architecture == $arch)
+               | select($variant == "" or (.platform.variant // "") == $variant) | .digest' \
+              2>/dev/null | head -n 1
+          }
+
+          RAW=$(skopeo inspect --raw "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
+          MEDIA=$(echo "$RAW" | jq -r '.mediaType // empty' 2>/dev/null || true)
+          if [[ "$MEDIA" == *manifest.list* || "$MEDIA" == *image.index* ]]; then
+            SUB_DIGEST=$(echo "$RAW" | pick_platform_digest || true)
+            if [ -n "$SUB_DIGEST" ] && [ "$SUB_DIGEST" != "null" ]; then
+              RAW=$(skopeo inspect --raw "docker://${FULL_IMAGE}@${SUB_DIGEST}" 2>/dev/null || echo '{}')
+            fi
+          fi
+          COMP_MB=$(( $(echo "$RAW" | jq -r '[.layers[]?.size] | add // 0' 2>/dev/null || echo 0) / 1024 / 1024 ))
+          # 峰值用量 ≈ 解压后的 tar（约压缩体积的 3 倍）+ pigz 再写一份 .gz（约 1 倍）
+          EST_MB=$(( COMP_MB * 4 + 256 ))
+          UNCERTAIN=0
+          if [ "$COMP_MB" -eq 0 ]; then
+            # 私有镜像拿不到 manifest 时预估为 0，不能当成「很小」
+            UNCERTAIN=1
+            EST_MB=0
+          fi
+
+          # 选剩余空间最大的可写目录：宿主机的 /tmp 可能挂在小容量 tmpfs 上，
+          # 此时 df / 显示的剩余空间并不代表真正能写多少。
+          WORK_DIR=""
+          FREE_MB=0
+          for d in /mnt "$RUNNER_TEMP" /var/tmp /tmp; do
+            [ -d "$d" ] || continue
+            if ! mkdir -p "$d/docker_sync" 2>/dev/null; then
+              # /mnt 一般是大容量数据盘但属 root，借 sudo 建目录再交回当前用户
+              sudo mkdir -p "$d/docker_sync" 2>/dev/null \
+                && sudo chown "$(id -u):$(id -g)" "$d/docker_sync" 2>/dev/null || continue
+            fi
+            f=$(df -Pm "$d/docker_sync" | awk 'NR==2 {print $4}')
+            [ -n "$f" ] || continue
+            echo "  $d 可用 ${f}MB"
+            if [ "$f" -gt "$FREE_MB" ]; then FREE_MB="$f"; WORK_DIR="$d/docker_sync"; fi
+          done
+          [ -n "$WORK_DIR" ] || { echo "::error::找不到可写的工作目录"; exit 1; }
+          echo "预估峰值: ~${EST_MB}MB | 工作目录: ${WORK_DIR} 可用: ${FREE_MB}MB"
+
+          if [ "$UNCERTAIN" = "1" ] || [ $((FREE_MB - EST_MB)) -lt 5120 ]; then
+            echo "空间偏紧，清理预装工具链…"
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                         /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-                        /usr/local/share/powershell /usr/share/swift
+                        /usr/local/share/powershell /usr/share/swift \
+                        /opt/az /usr/lib/jvm 2>/dev/null || true
+            sudo docker image prune -af > /dev/null 2>&1 || true
             sudo apt-get clean
+            FREE_MB=$(df -Pm "$WORK_DIR" | awk 'NR==2 {print $4}')
+            echo "清理后可用: ${FREE_MB}MB"
           fi
+
+          # 预估可信但仍然放不下时直接报错，避免跑到压缩阶段才失败
+          if [ "$UNCERTAIN" = "0" ] && [ $((FREE_MB - EST_MB)) -lt 2048 ]; then
+            echo "::error::磁盘空间不足：预估需要 ${EST_MB}MB，${WORK_DIR} 仅剩 ${FREE_MB}MB"
+            exit 1
+          fi
+          echo "WORK_DIR=${WORK_DIR}" >> "$GITHUB_ENV"
 
       - name: 4. 拉取并压缩
         env:
@@ -160,11 +215,20 @@ jobs:
           PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
           [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
 
-          LOCAL_TAR="/tmp/${PAN_FILE_NAME}"
+          # 用第 3 步挑出的空间最大的目录，不用固定的 /tmp
+          WORK_DIR="${WORK_DIR:-/tmp/docker_sync}"
+          mkdir -p "$WORK_DIR"
+          LOCAL_TAR="${WORK_DIR}/${PAN_FILE_NAME}"
+          rm -f "$LOCAL_TAR" "${LOCAL_TAR}.gz"
           skopeo copy "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
           # pigz 会产出 .tar.gz，再改回 .tar 命名（内容仍是 gzip，与旧文件命名保持一致）
           pigz -9 -p 4 "$LOCAL_TAR"
-          mv "${LOCAL_TAR}.gz" "$LOCAL_TAR"
+          if [ -f "${LOCAL_TAR}.gz" ]; then
+            mv -f "${LOCAL_TAR}.gz" "$LOCAL_TAR"
+          else
+            echo "::error::压缩失败：${LOCAL_TAR}.gz 未生成"
+            exit 1
+          fi
 
           # 平台 manifest digest：必须与服务端 platform_digest 算法完全一致，否则回调时会
           # 被判「校验值不一致」。注意 skopeo inspect 的 {{.Digest}} 在多架构镜像下返回的是
@@ -187,9 +251,9 @@ jobs:
             echo "::error::无法解析镜像 ${FULL_IMAGE} 在 ${ARCH} 下的 digest"
             exit 1
           fi
-          SIZE_BYTES=$(stat -c%s "/tmp/${PAN_FILE_NAME}")
+          SIZE_BYTES=$(stat -c%s "$LOCAL_TAR")
           {
-            echo "LOCAL_FILE=/tmp/${PAN_FILE_NAME}"
+            echo "LOCAL_FILE=$LOCAL_TAR"
             echo "CHECKSUM_VALUE=$DIGEST"
             echo "SIZE_BYTES=$SIZE_BYTES"
           } >> "$GITHUB_ENV"
