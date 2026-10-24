@@ -114,85 +114,28 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq skopeo curl jq pigz
 
-      - name: 3. 登录镜像仓库
-        env:
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: 3. 磁盘按需清理
         run: |
           set -euo pipefail
-          # 预估体积前就要能读到 manifest，私有镜像 / 被限流时没登录会直接拿到空结果
-          if [[ "$FULL_IMAGE" == ghcr.io/* ]] && [ -n "${GHCR_TOKEN:-}" ]; then
-            echo "$GHCR_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
-          fi
-          if [[ "$FULL_IMAGE" == nvcr.io/* ]] && [ -n "${NGC_API_KEY:-}" ]; then
-            echo "$NGC_API_KEY" | skopeo login nvcr.io -u '$oauthtoken' --password-stdin
-          fi
-          if [[ "$FULL_IMAGE" == docker.io/* ]] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
-            echo "$DOCKERHUB_TOKEN" | skopeo login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
-          fi
-
-      - name: 4. 体积预估与磁盘清理
-        run: |
-          set -euo pipefail
-          # 打包目录放在 / 这块大盘上（RUNNER_TEMP 即 /home/runner/work/_temp）。
-          # 不用 /tmp：容器化 runner 的 /tmp 常被配额限制，会出现 df 显示几十 GB
-          # 可用、写入却报 Disk quota exceeded 的错位。
-          WORK_DIR="${RUNNER_TEMP:-/var/tmp}/docker-sync"
-          mkdir -p "$WORK_DIR"
-          echo "WORK_DIR=$WORK_DIR" >> "$GITHUB_ENV"
-          echo "目标目录挂载: $(findmnt -n -T "$WORK_DIR" -o TARGET,SOURCE,FSTYPE,OPTIONS)"
-          echo "/tmp 挂载: $(findmnt -n -T /tmp -o TARGET,SOURCE,FSTYPE,OPTIONS)"
-
-          # 多架构镜像的 --raw 返回的是 index（只有 .manifests，没有 .layers），
-          # 必须先按平台挑出子 manifest 再累加层大小，否则必然算出 0MB。
-          RAW=$(skopeo inspect --raw "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
-          if printf '%s' "$RAW" | jq -e '(.manifests | length) > 0' > /dev/null 2>&1; then
-            CHILD=$(printf '%s' "$RAW" | jq -r \
-              --arg os "$ARCH_OS" --arg arch "$ARCH_NAME" --arg variant "$ARCH_VARIANT" \
-              '.manifests[] | select(.platform.os == $os) | select(.platform.architecture == $arch) | select($variant == "" or (.platform.variant // "") == $variant) | .digest' \
-              | head -n 1)
-            if [ -n "$CHILD" ] && [ "$CHILD" != "null" ]; then
-              RAW=$(skopeo inspect --raw "docker://${FULL_REPO}@${CHILD}" 2>/dev/null || echo '{}')
-            fi
-          fi
-          RAW_BYTES=$(printf '%s' "$RAW" | jq -r '[.layers[].size] | add // 0' 2>/dev/null | head -n 1 || true)
-          case "$RAW_BYTES" in ''|*[!0-9]*) RAW_BYTES=0 ;; esac
-          if [ "$RAW_BYTES" -le 0 ]; then
-            echo "::warning::无法预估镜像体积（registry 未返回 layers），按 5GB 保守处理"
-            RAW_BYTES=$((5 * 1024 * 1024 * 1024))
-          fi
-          EST_MB=$((RAW_BYTES / 1024 / 1024))
-          # skopeo 先落 tar，pigz 再产出 .tar.gz，两份同时存在，峰值约 1.4 倍
-          NEED_MB=$((EST_MB * 14 / 10))
-          FREE_MB=$(df -m "$WORK_DIR" | awk 'NR==2 {print $4}')
-          echo "预估 tar: ~${EST_MB}MB（峰值 ~${NEED_MB}MB）| ${WORK_DIR} 可用: ${FREE_MB}MB"
-
-          cleanup_disk() {
+          RAW=$(skopeo inspect --raw "docker://${FULL_IMAGE}" || echo '{}')
+          SIZE=$(echo "$RAW" | jq -r '[.layers[].size] | add // 0' 2>/dev/null || echo 0)
+          EST_MB=$(( SIZE * 3 / 1024 / 1024 ))
+          FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
+          echo "预估 tar: ~${EST_MB}MB | 可用: ${FREE_MB}MB"
+          if [ "$EST_MB" -ge 10240 ] || [ $((FREE_MB - EST_MB)) -lt 5120 ]; then
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                         /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
                         /usr/local/share/powershell /usr/share/swift
             sudo apt-get clean
-            sudo docker system prune -af --volumes > /dev/null 2>&1 || true
-          }
-
-          if [ $((FREE_MB - NEED_MB)) -lt 1024 ]; then
-            echo "空间不足，先清理再复查…"
-            cleanup_disk
-            FREE_MB=$(df -m "$WORK_DIR" | awk 'NR==2 {print $4}')
-            echo "清理后可用: ${FREE_MB}MB"
-          fi
-          if [ $((FREE_MB - NEED_MB)) -lt 1024 ]; then
-            HINT="磁盘空间不足：需要 ${NEED_MB}MB，${WORK_DIR} 只剩 ${FREE_MB}MB；挂载=$(findmnt -n -T "$WORK_DIR" -o SOURCE,FSTYPE,OPTIONS)"
-            echo "::error::$HINT"
-            echo "FAIL_HINT=$HINT" >> "$GITHUB_ENV"
-            exit 1
           fi
 
-      - name: 5. 拉取并压缩
+      - name: 4. 拉取并压缩
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
           # 阶段回调：开始拉取
@@ -203,10 +146,21 @@ jobs:
               -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在跨海拉取并压缩镜像…\",\"projectType\":\"docker\"}" || true
           fi
 
+          # 各 registry 的登录（都配了才登；公开镜像不需要）
+          if [[ "$FULL_IMAGE" == ghcr.io/* ]] && [ -n "${GHCR_TOKEN:-}" ]; then
+            echo "$GHCR_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+          fi
+          if [[ "$FULL_IMAGE" == nvcr.io/* ]] && [ -n "${NGC_API_KEY:-}" ]; then
+            echo "$NGC_API_KEY" | skopeo login nvcr.io -u '$oauthtoken' --password-stdin
+          fi
+          if [[ "$FULL_IMAGE" == docker.io/* ]] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "$DOCKERHUB_TOKEN" | skopeo login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
+          fi
+
           PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
           [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
 
-          LOCAL_TAR="${WORK_DIR}/${PAN_FILE_NAME}"
+          LOCAL_TAR="/tmp/${PAN_FILE_NAME}"
           skopeo copy "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
           # pigz 会产出 .tar.gz，再改回 .tar 命名（内容仍是 gzip，与旧文件命名保持一致）
           pigz -9 -p 4 "$LOCAL_TAR"
@@ -233,15 +187,15 @@ jobs:
             echo "::error::无法解析镜像 ${FULL_IMAGE} 在 ${ARCH} 下的 digest"
             exit 1
           fi
-          SIZE_BYTES=$(stat -c%s "${LOCAL_TAR}")
+          SIZE_BYTES=$(stat -c%s "/tmp/${PAN_FILE_NAME}")
           {
-            echo "LOCAL_FILE=${LOCAL_TAR}"
+            echo "LOCAL_FILE=/tmp/${PAN_FILE_NAME}"
             echo "CHECKSUM_VALUE=$DIGEST"
             echo "SIZE_BYTES=$SIZE_BYTES"
           } >> "$GITHUB_ENV"
           echo "digest=$DIGEST size=${SIZE_BYTES}B"
 
-      - name: 6. 领取网盘凭证
+      - name: 5. 领取网盘凭证
         shell: bash
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
@@ -273,7 +227,7 @@ jobs:
             echo "__COOKIE_EOF__"
           } >> "$GITHUB_ENV"
 
-      - name: 7. 启动 AList 并挂载网盘
+      - name: 6. 启动 AList 并挂载网盘
         shell: bash
         run: |
           set -euo pipefail
@@ -309,7 +263,7 @@ jobs:
             exit 1
           fi
 
-      - name: 8. 上传并取文件 ID
+      - name: 7. 上传并取文件 ID
         shell: bash
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
@@ -363,7 +317,7 @@ jobs:
             echo "PAN_PATH=${ROOT_FOLDER}/${CATEGORY_DIR}/${PAN_FILE_NAME}"
           } >> "$GITHUB_ENV"
 
-      - name: 9. 回调后端（上传完成）
+      - name: 8. 回调后端（上传完成）
         shell: bash
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
@@ -394,7 +348,7 @@ jobs:
             -H "X-Callback-Secret: $CALLBACK_SECRET" \
             -d "$PAYLOAD" || true
 
-      - name: 10. 失败回传（兜底）
+      - name: 9. 失败回传（兜底）
         if: failure()
         shell: bash
         env:
