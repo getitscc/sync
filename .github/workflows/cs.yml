@@ -1,12 +1,10 @@
-name: Docker Image Overseas Sync Engine (Scheme A - Arch Digest)
+name: Test Image Digest Consistency (No Upload)
 
 on:
-  repository_dispatch:
-    types: [docker_sync]
   workflow_dispatch:
     inputs:
       image_name:
-        description: '镜像全名'
+        description: '测试镜像全名'
         required: true
         default: 'nginx:stable-alpine3.24-slim'
       arch:
@@ -17,341 +15,87 @@ on:
         options:
           - amd64
           - arm64
-      task_id:
-        description: '任务追踪 ID'
-        required: false
-        default: ''
-      callback_url:
-        description: '回调通知接口'
-        required: false
-        default: ''
 
 jobs:
-  sync:
+  test-digest:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 输入参数解析与命名规格化
-        id: parse
-        env:
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
-        run: |
-          RAW_IMAGE="${{ github.event.client_payload.image_name || github.event.inputs.image_name || 'nginx:stable-alpine3.24-slim' }}"
-          ARCH="${{ github.event.client_payload.arch || github.event.inputs.arch || 'amd64' }}"
-          TASK_ID="${{ github.event.client_payload.task_id || github.event.inputs.task_id }}"
-          CALLBACK_URL="${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}"
-
-          if [ -z "$RAW_IMAGE" ]; then exit 1; fi
-          if [ -z "$TASK_ID" ]; then TASK_ID="manual_$(date +%s)"; fi
-
-          RAW_IMAGE=$(echo "$RAW_IMAGE" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-          CLEAN_NAME=$(echo "$RAW_IMAGE" | sed 's|^docker\.io/||' | sed 's|^library/||')
-
-          if [[ "$CLEAN_NAME" == *"/"* ]]; then
-              FIRST_PART="${CLEAN_NAME%%/*}"
-              if [[ "$FIRST_PART" == *"."* ]]; then
-                  CLEAN_NAME="${CLEAN_NAME#*/}"
-              fi
-          fi
-
-          if [[ "$CLEAN_NAME" == *":"* ]]; then
-              IMAGE_BASE="${CLEAN_NAME%%:*}"
-              TAG="${CLEAN_NAME##*:}"
-          else
-              IMAGE_BASE="$CLEAN_NAME"
-              TAG="latest"
-          fi
-
-          CLEAN_IMAGE_NAME=$(echo "$IMAGE_BASE" | tr '/' '-')
-          CATEGORY_DIR="${IMAGE_BASE##*/}"
-
-          # 针对 nginx:stable-alpine3.24-slim (amd64)，生成文件名为: nginx_stable-alpine3.24-slim_amd64.tar
-          SAFE_FILENAME="${CLEAN_IMAGE_NAME}_${TAG}_${ARCH}.tar"
-          LOCAL_TAR="/tmp/${SAFE_FILENAME}"
-
-          if [[ "$RAW_IMAGE" != *"/"* ]]; then
-            FULL_IMAGE="docker.io/library/${RAW_IMAGE}"
-          elif [[ "$RAW_IMAGE" != *"."* ]] || [[ "${RAW_IMAGE%%/*}" != *"."* ]]; then
-            FULL_IMAGE="docker.io/${RAW_IMAGE}"
-          else
-            FULL_IMAGE="${RAW_IMAGE}"
-          fi
-
-          echo "TASK_ID=$TASK_ID" >> $GITHUB_ENV
-          echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_ENV
-          echo "ARCH=$ARCH" >> $GITHUB_ENV
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "IMAGE_BASE=$IMAGE_BASE" >> $GITHUB_ENV
-          echo "SAFE_FILENAME=$SAFE_FILENAME" >> $GITHUB_ENV
-          echo "CATEGORY_DIR=$CATEGORY_DIR" >> $GITHUB_ENV
-          echo "LOCAL_TAR=$LOCAL_TAR" >> $GITHUB_ENV
-          echo "CALLBACK_URL=$CALLBACK_URL" >> $GITHUB_ENV
-
-          if [ -n "$CALLBACK_URL" ]; then
-            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
-              -H "Content-Type: application/json" \
-              -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"prepared\",\"message\":\"参数解析完成: $ SAFE_FILENAME\"}" || true
-          fi
-
-      - name: 2. 安装必要运行工具链与 Cloudflare WARP
-        env:
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+      - name: 1. 安装测试工具 (skopeo / jq / pigz)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq skopeo curl jq pigz gpg
+          sudo apt-get install -y -qq skopeo jq pigz
 
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cloudflare-warp
-
-      - name: 3. [方案A核心] 提取官网 linux/amd64 专属 Manifest Digest 与按需清理磁盘
-        env:
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+      - name: 2. 下载打包、再导入并与官网核对 Manifest Digest
         run: |
-          echo "🔍 正在向 Registry 获取 ${FULL_IMAGE} 的官方原始 Manifest..."
+          RAW_IMAGE="${{ github.event.inputs.image_name || 'nginx:stable-alpine3.24-slim' }}"
+          ARCH="${{ github.event.inputs.arch || 'amd64' }}"
+          FULL_IMAGE="docker.io/library/${RAW_IMAGE}"
+          IMAGE_WITHOUT_TAG="${FULL_IMAGE%%:*}"
+
+          echo "🔍 1. 获取官网 ${FULL_IMAGE} (linux/${ARCH}) 的真实 Digest..."
           RAW_MANIFEST=$(skopeo inspect --raw "docker://${FULL_IMAGE}")
-          # 计算顶层 Index Digest
-          INDEX_DIGEST="sha256:$(echo -n "$RAW_MANIFEST" | sha256sum | awk '{print $1}')"
-          MEDIA_TYPE=$(echo "$RAW_MANIFEST" | jq -r '.mediaType // empty' 2>/dev/null || true)
-          IMAGE_WITHOUT_TAG="${FULL_IMAGE%%:*}"
+          OFFICIAL_ARCH_DIGEST=$(echo "$RAW_MANIFEST" | jq -r --arg arch "$ARCH" '
+            .manifests[] 
+            | select(.platform.architecture == $arch and .platform.os == "linux" and (.annotations["vnd.docker.reference.type"] == null)) 
+            | .digest' | head -n 1)
 
-          # 判断是否为多架构索引 (Manifest List / OCI Index)
-          if [ "$MEDIA_TYPE" = "application/vnd.docker.distribution.manifest.list.v2+json" ] || [ "$MEDIA_TYPE" = "application/vnd.oci.image.index.v1+json" ]; then
-              # 严格匹配 linux/$ARCH (如 linux/amd64)，排除 attestation/unknown 干扰项
-              ARCH_DIGEST=$(echo "$RAW_MANIFEST" | jq -r --arg arch "$ARCH" '
-                .manifests[] 
-                | select(.platform.architecture == $arch and .platform.os == "linux" and (.annotations["vnd.docker.reference.type"] == null)) 
-                | .digest' 2>/dev/null | head -n 1)
+          ARCH_MANIFEST=$(skopeo inspect --raw "docker://${IMAGE_WITHOUT_TAG}@${OFFICIAL_ARCH_DIGEST}")
+          OFFICIAL_IMAGE_ID=$(echo "$ARCH_MANIFEST" | jq -r '.config.digest')
 
-              if [ -z "$ARCH_DIGEST" ] || [ "$ARCH_DIGEST" == "null" ]; then
-                  echo "❌ 错误：在官网多架构清单中未找到 linux/${ARCH} 架构！"
-                  exit 1
-              fi
-              # 拉取该架构专属的子 Manifest
-              ARCH_MANIFEST=$(skopeo inspect --raw "docker://${IMAGE_WITHOUT_TAG}@${ARCH_DIGEST}")
+          echo "=========================================================="
+          echo "🌐 官网 linux/${ARCH} Manifest Digest : $OFFICIAL_ARCH_DIGEST"
+          echo "🆔 官网 linux/${ARCH} Image ID        : $OFFICIAL_IMAGE_ID"
+          echo "=========================================================="
+
+          # ---------------- 测试 1: oci-archive 格式打包再导入 ----------------
+          echo ""
+          echo "🧪 [测试 1] 使用 oci-archive 格式打包并导入 containerd (保留完整 Manifest Digest)..."
+          OCI_TAR="/tmp/test_oci.tar"
+          skopeo copy --override-os linux --override-arch "$ARCH" \
+            "docker://${IMAGE_WITHOUT_TAG}@${OFFICIAL_ARCH_DIGEST}" \
+            "oci-archive:${OCI_TAR}:${RAW_IMAGE}"
+
+          # 使用 pigz 压缩再解压，模拟真实上传下载过程
+          pigz -9 -p 4 "$OCI_TAR"
+          unpigz "${OCI_TAR}.gz"
+
+          # 验证解压后的包内 Manifest Digest
+          LOCAL_OCI_DIGEST=$(skopeo inspect "oci-archive:${OCI_TAR}" | jq -r '.Digest')
+          # 直接导入到 GitHub Runner 的底层 containerd 引擎验证
+          sudo ctr images import "$OCI_TAR" > /dev/null
+          CTR_IMPORTED_DIGEST=$(sudo ctr images ls | grep "${RAW_IMAGE}" | awk '{print $3}' | head -n 1)
+
+          echo "   -> 官网预期 Manifest Digest       : $OFFICIAL_ARCH_DIGEST"
+          echo "   -> 归档包内实测 Manifest Digest   : $LOCAL_OCI_DIGEST"
+          echo "   -> 导入引擎后实测 Manifest Digest : $CTR_IMPORTED_DIGEST"
+
+          if [ "$OFFICIAL_ARCH_DIGEST" == "$LOCAL_OCI_DIGEST" ] && [ "$OFFICIAL_ARCH_DIGEST" == "$CTR_IMPORTED_DIGEST" ]; then
+            echo "   ✅ 完美通过！导入后的 Manifest Digest 与官网 100% 一模一样！"
           else
-              # 单架构镜像：顶层 Digest 即为架构专属 Manifest Digest
-              ARCH_DIGEST="$INDEX_DIGEST"
-              ARCH_MANIFEST="$RAW_MANIFEST"
-          fi
-
-          # 提取官方 Config Digest (即本地 docker images 看到的 IMAGE ID)
-          OFFICIAL_IMAGE_ID=$(echo "$ARCH_MANIFEST" | jq -r '.config.digest // empty')
-
-          echo "=========================================================="
-          echo "🎯 目标镜像:                      $FULL_IMAGE (linux/$ARCH)"
-          echo "🌐 官网顶层 Index Digest:         $INDEX_DIGEST"
-          echo "🔒 官网架构专属 Manifest Digest:  $ARCH_DIGEST"
-          echo "🆔 官网内部 Config Image ID:      $OFFICIAL_IMAGE_ID"
-          echo "=========================================================="
-
-          # 注入环境变量供 Step 5 锁定拉取与 Step 7 回调入库使用
-          echo "OFFICIAL_INDEX_DIGEST=$INDEX_DIGEST" >> $GITHUB_ENV
-          echo "OFFICIAL_ARCH_DIGEST=$ARCH_DIGEST" >> $GITHUB_ENV
-          echo "OFFICIAL_IMAGE_ID=$OFFICIAL_IMAGE_ID" >> $GITHUB_ENV
-
-          # 预估体积与按需磁盘清理
-          COMPRESSED_SIZE=$(echo "$ARCH_MANIFEST" | jq -r '[.layers[].size] | add // 0' 2>/dev/null || echo 0)
-          ESTIMATED_MB=$(( COMPRESSED_SIZE * 3 / 1024 / 1024 ))
-          FREE_SPACE_MB=$(df -m / | awk 'NR==2 {print $4}')
-
-          if [ "$ESTIMATED_MB" -ge 10240 ] || [ $((FREE_SPACE_MB - ESTIMATED_MB)) -lt 5120 ]; then
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            sudo docker image prune --all --force > /dev/null 2>&1 || true
-            sudo apt-get clean
-          fi
-
-      - name: 4. 挂载 AList 临时容器
-        env:
-          QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
-        run: |
-          if [ -z "$QUARK_COOKIE" ]; then echo "❌ 缺少 QUARK_COOKIE Secret"; exit 1; fi
-          CLEAN_COOKIE=$(echo "$QUARK_COOKIE" | sed -e 's/^Cookie:[[:space:]]*//i' | tr -d '\r\n')
-          echo "CLEAN_COOKIE=$CLEAN_COOKIE" >> $GITHUB_ENV
-
-          docker run -d --name alist_sync -p 5244:5244 xhofe/alist:latest > /dev/null
-          until curl -s http://127.0.0.1:5244/api/public/settings > /dev/null; do sleep 1; done
-          docker exec alist_sync ./alist admin set 123456 > /dev/null
-
-          TOKEN=$(curl -s -X POST http://127.0.0.1:5244/api/auth/login -H "Content-Type: application/json" -d '{"username": "admin", "password": "123456"}' | jq -r '.data.token' 2>/dev/null)
-          if [ -z "$TOKEN" ] || [ "$TOKEN" == "null" ]; then exit 1; fi
-          echo "ALIST_TOKEN=$TOKEN" >> $GITHUB_ENV
-
-          STORAGE_PAYLOAD=$(jq -n --arg cookie "$CLEAN_COOKIE" '{mount_path: "/quark", order: 0, remark: "temp_driver", driver: "Quark", addition: ({cookie: $cookie, root_folder_id: "0"} | tojson)}')
-          MOUNT_RES=$(curl -s -X POST http://127.0.0.1:5244/api/admin/storage/create -H "Authorization: $TOKEN" -H "Content-Type: application/json" -d "$STORAGE_PAYLOAD")
-          if [ "$(echo "$MOUNT_RES" | jq -r '.code // 500')" != "200" ]; then exit 1; fi
-
-      - name: 5. [方案A核心] 按架构 Digest 锁定拉取、本地指纹核验与直传网盘
-        env:
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
-        run: |
-          if [ -n "$CALLBACK_URL" ]; then
-            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在按官网架构 Digest (${OFFICIAL_ARCH_DIGEST:0:19}...) 锁定拉取镜像...\"}" || true
-          fi
-
-          IMAGE_WITHOUT_TAG="${FULL_IMAGE%%:*}"
-          # 关键：使用 @OFFICIAL_ARCH_DIGEST 精确锁定拉取，绝不发生版本漂移
-          PINNED_SOURCE="docker://${IMAGE_WITHOUT_TAG}@${OFFICIAL_ARCH_DIGEST}"
-
-          echo "📥 [1/4] 正在从官方源锁定架构 Digest 拉取: $PINNED_SOURCE"
-          skopeo copy \
-            --override-os linux \
-            --override-arch "$ARCH" \
-            "$PINNED_SOURCE" \
-            "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
-
-          echo "🔐 [2/4] 正在校验本地落盘 Tar 包与官网指纹一致性..."
-          LOCAL_CONFIG_FILE=$(tar -xOf "$LOCAL_TAR" manifest.json | jq -r '.[0].Config')
-          LOCAL_IMAGE_ID="sha256:${LOCAL_CONFIG_FILE%.json}"
-
-          echo "   -> 官网预期 Image ID: $OFFICIAL_IMAGE_ID"
-          echo "   -> 本地实测 Image ID: $LOCAL_IMAGE_ID"
-
-          if [ "$LOCAL_IMAGE_ID" != "$OFFICIAL_IMAGE_ID" ]; then
-            echo "❌ 致命错误：本地镜像指纹与官网不一致，终止上传！"
-            if [ -n "$CALLBACK_URL" ]; then
-              curl -sS -o /dev/null -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"status\":\"failed\",\"error\":\"镜像指纹校验不通过\"}" || true
-            fi
+            echo "   ❌ 测试失败：Digest 不一致！"
             exit 1
           fi
-          echo "✅ 指纹核验 100% 匹配！该包与 Docker Hub 官网 linux/$ARCH 完全一致。"
 
-          echo "🗜️ [3/4] 启动多核 pigz 压缩..."
-          pigz -9 -p 4 "$LOCAL_TAR"
-          mv "${LOCAL_TAR}.gz" "$LOCAL_TAR"
+          # ---------------- 测试 2: docker-archive 格式打包再 docker load ----------------
+          echo ""
+          echo "🧪 [测试 2] 使用你原有的 docker-archive 格式打包并执行 docker load..."
+          DOCKER_TAR="/tmp/test_docker.tar"
+          skopeo copy --override-os linux --override-arch "$ARCH" \
+            "docker://${IMAGE_WITHOUT_TAG}@${OFFICIAL_ARCH_DIGEST}" \
+            "docker-archive:${DOCKER_TAR}:${RAW_IMAGE}"
 
-          curl -s -X POST http://127.0.0.1:5244/api/fs/mkdir -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" -d '{"path": "/quark/docker_images/'"$CATEGORY_DIR"'"}' > /dev/null
-          # 清理同名旧包，确保最新 Digest 覆盖写入
-          curl -s -X POST http://127.0.0.1:5244/api/fs/remove -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" -d '{"dir": "/quark/docker_images/'"$CATEGORY_DIR"'", "names": ["'"$SAFE_FILENAME"'"]}' > /dev/null || true
+          pigz -9 -p 4 "$DOCKER_TAR"
+          mv "${DOCKER_TAR}.gz" "$DOCKER_TAR"
 
-          if [ -n "$CALLBACK_URL" ]; then
-            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"uploading\",\"message\":\"指纹校验通过，正在直传夸克网盘\"}" || true
-          fi
+          docker load -i "$DOCKER_TAR"
+          LOADED_IMAGE_ID=$(docker inspect --format='{{.Id}}' "$RAW_IMAGE")
 
-          echo "📤 [4/4] 直传夸克网盘..."
-          curl -X PUT -# \
-            -H "Authorization: $ALIST_TOKEN" \
-            -H "File-Path: /quark/docker_images/${CATEGORY_DIR}/${SAFE_FILENAME}" \
-            -H "As-Task: false" \
-            -T "$LOCAL_TAR" \
-            "http://127.0.0.1:5244/api/fs/put" | tee upload_res.json
+          echo "   -> 官网预期 Image ID (Config)     : $OFFICIAL_IMAGE_ID"
+          echo "   -> docker load 导入后实测 Image ID : $LOADED_IMAGE_ID"
 
-          if [ "$(jq -r '.code // 500' upload_res.json 2>/dev/null)" != "200" ]; then
-             echo "❌ 直传网盘失败"
-             exit 1
-          fi
-          rm -f "$LOCAL_TAR" upload_res.json
-
-      - name: 6. 激活 Cloudflare WARP 代理环境
-        run: |
-          sudo warp-cli --accept-tos registration new || true
-          sudo warp-cli --accept-tos mode proxy
-          sudo warp-cli --accept-tos proxy port 40000
-          sudo warp-cli --accept-tos connect
-          for i in {1..10}; do
-            sleep 1
-            if sudo warp-cli --accept-tos status 2>/dev/null | grep -q "Connected"; then break; fi
-          done
-
-      - name: 7. 生成夸克分享链接并回调架构专属 Manifest Digest
-        env:
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
-        run: |
-          call_quark_warp() {
-            local method="$1"; local url="$2"; local data="$3"
-            local cmd=(curl -s --socks5-hostname 127.0.0.1:40000 -X "$method" "$url"
-              -b "$CLEAN_COOKIE"
-              -H 'accept: application/json, text/plain, */*'
-              -H 'origin: https://pan.quark.cn'
-              -H 'referer: https://pan.quark.cn/'
-              -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36')
-            if [ -n "$data" ]; then cmd+=(-H 'content-type: application/json' -d "$data"); fi
-            "${cmd[@]}"
-          }
-
-          ROOT_JSON=$(call_quark_warp GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0&_size=100")
-          ROOT_FID=$(echo "$ROOT_JSON" | jq -r '.data.list[] | select(.file_name=="docker_images") | .fid' 2>/dev/null || echo "")
-
-          CAT_FID=""
-          if [ -n "$ROOT_FID" ]; then
-            CAT_JSON=$(call_quark_warp GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${ROOT_FID}&_size=100")
-            CAT_FID=$(echo "$CAT_JSON" | jq -r --arg cat "$CATEGORY_DIR" '.data.list[] | select(.file_name==$cat) | .fid' 2>/dev/null || echo "")
-          fi
-
-          TARGET_FID=""
-          if [ -n "$CAT_FID" ]; then
-            FILE_JSON=$(call_quark_warp GET "https://drive-pc.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=${CAT_FID}&_size=100")
-            TARGET_FID=$(echo "$FILE_JSON" | jq -r --arg fn "$SAFE_FILENAME" '.data.list[] | select(.file_name==$fn) | .fid' 2>/dev/null || echo "")
-          fi
-
-          SHARE_URL=""; PASSCODE=""
-          if [ -n "$TARGET_FID" ]; then
-            PASSCODE=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 4)
-            SHARE_PAYLOAD=$(jq -n --arg fid "$TARGET_FID" --arg pwd "$PASSCODE" '{"fid_list":[$fid],"title":"来自：分享","url_type":2,"passcode":$pwd,"expired_type":1,"support_error_code":["41060"]}')
-            SHARE_RES=$(call_quark_warp POST "https://drive-pc.quark.cn/1/clouddrive/share?pr=ucpro&fr=pc&uc_param_str=" "$SHARE_PAYLOAD")
-            TASK_QUEUE_ID=$(echo "$SHARE_RES" | jq -r '.data.task_id // empty' 2>/dev/null || echo "")
-            SHARE_ID=$(echo "$SHARE_RES" | jq -r '.data.task_resp.data.share_id // .data.share_id // empty' 2>/dev/null || echo "")
-
-            if [ -n "$TASK_QUEUE_ID" ] && [ -z "$SHARE_ID" ]; then
-              for i in {0..10}; do
-                sleep 2
-                TASK_STATUS=$(call_quark_warp GET "https://drive-pc.quark.cn/1/clouddrive/task?pr=ucpro&fr=pc&uc_param_str=&task_id=${TASK_QUEUE_ID}&retry_index=${i}")
-                if [ "$(echo "$TASK_STATUS" | jq -r '.data.status // empty' 2>/dev/null)" == "2" ]; then
-                  SHARE_ID=$(echo "$TASK_STATUS" | jq -r '.data.share_id // .data.save_as.share_id // .data.task_resp.data.share_id // empty' 2>/dev/null || echo "")
-                  break
-                fi
-              done
-            fi
-
-            if [ -n "$SHARE_ID" ]; then
-              PWD_RES=$(call_quark_warp POST "https://drive-pc.quark.cn/1/clouddrive/share/password?pr=ucpro&fr=pc&uc_param_str=" "{\"share_id\":\"$SHARE_ID\"}")
-              SHARE_URL=$(echo "$PWD_RES" | jq -r '.data.share_url // .data.url // empty' 2>/dev/null || echo "")
-              if [ -z "$SHARE_URL" ]; then
-                PWD_ID=$(echo "$PWD_RES" | jq -r '.data.pwd_id // empty' 2>/dev/null || echo "")
-                SHARE_URL="https://pan.quark.cn/s/${PWD_ID:-$SHARE_ID}"
-              fi
-            fi
-          fi
-
-          # 【方案 A 关键点】：直接将 Step 3 锁定的架构专属 Manifest Digest 传回给前端 Worker 存入 D1 数据库
-          DIGEST="$OFFICIAL_ARCH_DIGEST"
-
-          if [ -n "$CALLBACK_URL" ]; then
-            STATUS="$( [ -n "$SHARE_URL" ] && echo uploaded || echo failed )"
-            ERROR_MSG="$( [ -z "$SHARE_URL" ] && echo "镜像已上传网盘，但官方分享链接生成失败" || echo "" )"
-
-            PAYLOAD=$(jq -n \
-              --arg taskId "$TASK_ID" \
-              --arg status "$STATUS" \
-              --arg error "$ERROR_MSG" \
-              --arg imageBase "$IMAGE_BASE" \
-              --arg imageName "$FULL_IMAGE" \
-              --arg tag "$TAG" \
-              --arg arch "$ARCH" \
-              --arg fileName "$SAFE_FILENAME" \
-              --arg shareUrl "$SHARE_URL" \
-              --arg passcode "$PASSCODE" \
-              --arg digest "$DIGEST" \
-              --arg indexDigest "$OFFICIAL_INDEX_DIGEST" \
-              '{
-                taskId: $taskId,
-                status: $status,
-                error: (if $error != "" then $error else null end),
-                imageBase: $imageBase,
-                imageName: $imageName,
-                tag: $tag,
-                arch: $arch,
-                fileName: $fileName,
-                shareUrl: $shareUrl,
-                passcode: $passcode,
-                digest: $digest,
-                indexDigest: $indexDigest
-              }')
-
-            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
-              -H "Content-Type: application/json" \
-              -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "$PAYLOAD" || true
+          if [ "$OFFICIAL_IMAGE_ID" == "$LOADED_IMAGE_ID" ]; then
+            echo "   ✅ 完美通过！docker load 导入后的 Image ID 与官网 100% 一模一样！"
+          else
+            echo "   ❌ 测试失败：Image ID 不一致！"
+            exit 1
           fi
