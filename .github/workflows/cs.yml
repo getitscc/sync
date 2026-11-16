@@ -1,20 +1,21 @@
-name: Docker Sync (Plan A — Overseas Pull + Domestic Worker Upload)
+name: Docker Sync (R2 — Overseas Pull + R2 Upload)
 
 # =====================================================
-# 方案 A 核心变化（对比原版）：
-#   ❌ 不再在海外 Runner 启动 AList / 领 Cookie / 上传网盘
-#   ✅ skopeo 拉取 + pigz 压缩 → rsync (SSH) 断点续推国内轻量云
-#   ✅ 国内轻量云（常驻 AList + 多网盘账号）负责上传网盘、生成分享
-#   ✅ 加 concurrency 防爆：同时最多 2 个大体积传输任务，保护国内 40GB 硬盘
+# 当前链路：
+#   ✅ skopeo 拉取 + pigz 压缩
+#   ✅ rclone 直传 Cloudflare R2（不再经过国内服务器/网盘）
+#   ✅ 回调 Worker 写 D1，前端通过 /api/download/:id 下载
 #
-# 需要在仓库 Secrets 里新增（原有 secrets 继续用）：
-#   CN_SERVER_SSH_KEY   — 国内轻量云 SSH 私钥（ed25519）
-#   CN_SERVER_HOST      — 国内轻量云公网 IP / 域名
-#   CN_SERVER_PORT      — SSH 端口（默认 22）
-#   CN_SERVER_USER      — SSH 用户
-#   CN_SERVER_INCOMING  — 国内收件目录（默认 /data/jishi/incoming）
-#   CN_WORKER_WEBHOOK   — 国内分发 Worker 的 webhook 地址
-#   WEBHOOK_TOKEN       — 国内 Worker 验签 token
+# 需要在仓库 Secrets 里配置：
+#   R2_ACCOUNT_ID        — Cloudflare 账号 ID
+#   R2_ACCESS_KEY_ID     — R2 API Token 的 Access Key ID
+#   R2_SECRET_ACCESS_KEY — R2 API Token 的 Secret Access Key
+#   R2_BUCKET            — 桶名（默认 jishi）
+#   R2_PREFIX            — 对象键前缀（默认 docker）
+#   CALLBACK_SECRET      — 与 Worker 的 WEBHOOK_SECRET 一致
+#
+# 本仓库只保留此 workflow。测试环境复用同一文件：
+#   同一个 jishi 桶，R2_PREFIX=docker-，callback_url 指向测试 Worker。
 # =====================================================
 
 on:
@@ -35,7 +36,7 @@ on:
         required: false
         default: 'linux/amd64'
       profile_id:
-        description: '（方案 A 中不再使用，保留兼容）网盘账号 ID'
+        description: '（兼容保留，当前链路不使用）账号 ID'
         required: false
         default: ''
       task_id:
@@ -47,17 +48,15 @@ on:
         required: false
         default: ''
 
-# 并发防爆：同一时间最多 2 个传输任务，保护国内轻量云 40GB 硬盘空间
-# 说明：按 run_id 分组（每个 run 独占一个 slot），不会互相取消；
-# 但一旦活跃 run 数超过 2，后续 run 会排队等待
+# 并发控制：同一时间只跑 1 个 R2 上传任务，避免占满 Runner 磁盘与带宽
 concurrency:
-  group: domestic-transfer-slot-${{ github.run_id }}
+  group: r2-transfer
   cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     steps:
       # ============================================================
       # 步骤 1~4：参数解析 + 拉取打包（和原版完全一致，保留成熟逻辑）
@@ -104,7 +103,9 @@ jobs:
 
           CATEGORY_DIR="${SOURCE##*/}"
           SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
-          PAN_FILE_NAME="${SAFE_NAME}_${VERSION}_${ARCH_SAFE}.tar"
+          TAR_NAME="${SAFE_NAME}_${VERSION}_${ARCH_SAFE}.tar"
+          # 实际跨境传输的是 pigz 压缩后的 .tar.gz，文件名必须如实反映内容
+          PAN_FILE_NAME="${TAR_NAME}.gz"
 
           TASK_ID="${IN_TASK:-manual_$(date +%s)}"
           CALLBACK_URL="$IN_CALLBACK"
@@ -118,6 +119,7 @@ jobs:
             echo "ARCH_NAME=$ARCH_NAME"
             echo "ARCH_VARIANT=$ARCH_VARIANT"
             echo "CATEGORY_DIR=$CATEGORY_DIR"
+            echo "TAR_NAME=$TAR_NAME"
             echo "PAN_FILE_NAME=$PAN_FILE_NAME"
             echo "TASK_ID=$TASK_ID"
             echo "CALLBACK_URL=$CALLBACK_URL"
@@ -131,10 +133,10 @@ jobs:
               -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"prepared\",\"message\":\"参数解析完成，准备拉取\",\"projectType\":\"docker\"}" || true
           fi
 
-      - name: 2. 安装工具链（含 rsync）
+      - name: 2. 安装工具链（含 rclone）
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq skopeo curl jq pigz rsync openssh-client
+          sudo apt-get install -y -qq skopeo curl jq pigz rclone
 
       - name: 3. 磁盘按需清理与工作目录准备
         env:
@@ -210,15 +212,16 @@ jobs:
           PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
           [ -n "$ARCH_VARIANT" ] && PLATFORM+=(--override-variant "$ARCH_VARIANT")
 
-          LOCAL_TAR="${WORK_DIR}/${PAN_FILE_NAME}"
+          LOCAL_TAR="${WORK_DIR}/${TAR_NAME}"
+          LOCAL_FILE="${LOCAL_TAR}.gz"
           skopeo copy --tmpdir "$TMPDIR" "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
 
           # 立即清空 skopeo 临时缓存，为接下来的 pigz 压缩腾出最大磁盘空间
           rm -rf "${TMPDIR:?}"/*
 
-          # pigz 压缩（方案 A 保留压缩，跨境传输量减少约 60%~80%，比裸 .tar 快得多）
+          # pigz 压缩（跨境传输量减少约 60%~80%），产物就是 .tar.gz，不再改名
           pigz -6 -p 4 "$LOCAL_TAR"
-          mv "${LOCAL_TAR}.gz" "$LOCAL_TAR"
+          [ -f "$LOCAL_FILE" ] || { echo "::error::pigz 未生成 $LOCAL_FILE"; exit 1; }
 
           # 平台 manifest digest（多架构镜像下取对应 os/arch/variant 的平台 digest）
           RAW_MANIFEST=$(skopeo inspect --raw "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
@@ -238,12 +241,12 @@ jobs:
             exit 1
           fi
 
-          # 额外算 SHA256 + MD5（供国内 Worker 网盘秒传哈希比对）
-          SHA256_SUM=$(sha256sum "$LOCAL_TAR" | awk '{print $1}')
-          MD5_SUM=$(md5sum "$LOCAL_TAR" | awk '{print $1}')
-          SIZE_BYTES=$(stat -c%s "$LOCAL_TAR")
+          # 额外算 SHA256 + MD5（对压缩后的 .tar.gz 计算，供前端校验）
+          SHA256_SUM=$(sha256sum "$LOCAL_FILE" | awk '{print $1}')
+          MD5_SUM=$(md5sum "$LOCAL_FILE" | awk '{print $1}')
+          SIZE_BYTES=$(stat -c%s "$LOCAL_FILE")
 
-          # 写入元数据描述文件（国内 Worker 读取）
+          # 写入元数据描述文件（R2 上传与回调排查用）
           jq -n \
             --arg task_id "$TASK_ID" \
             --arg full_image "$FULL_IMAGE" \
@@ -264,10 +267,10 @@ jobs:
               arch_variant:$arch_variant, file_name:$file_name, category_dir:$category_dir,
               file_size:$size, sha256:$sha256, md5:$md5, docker_digest:$docker_digest,
               packed_at:(now|floor)}' \
-            > "${LOCAL_TAR}.meta.json"
+            > "${LOCAL_FILE}.meta.json"
 
           {
-            echo "LOCAL_FILE=$LOCAL_TAR"
+            echo "LOCAL_FILE=$LOCAL_FILE"
             echo "CHECKSUM_VALUE=$DIGEST"
             echo "SHA256_SUM=$SHA256_SUM"
             echo "MD5_SUM=$MD5_SUM"
@@ -276,147 +279,113 @@ jobs:
           echo "digest=$DIGEST sha256=$SHA256_SUM size=${SIZE_BYTES}B"
 
       # ============================================================
-      # 步骤 5（新）：rsync 断点续推国内轻量云
+      # 步骤 5（新）：rclone 直传 Cloudflare R2
       # ============================================================
 
-      - name: 5. rsync 断点续推国内轻量云
+      - name: 5. 上传至 Cloudflare R2
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.CN_SERVER_SSH_KEY }}
-          CN_HOST: ${{ secrets.CN_SERVER_HOST }}
-          CN_PORT: ${{ secrets.CN_SERVER_PORT }}
-          CN_USER: ${{ secrets.CN_SERVER_USER }}
-          CN_INCOMING: ${{ secrets.CN_SERVER_INCOMING }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PREFIX: ${{ secrets.R2_PREFIX }}
         run: |
           set -euo pipefail
-          [ -n "${SSH_PRIVATE_KEY:-}" ] || { echo "::error::缺少 secret CN_SERVER_SSH_KEY"; exit 1; }
-          [ -n "${CN_HOST:-}" ] || { echo "::error::缺少 secret CN_SERVER_HOST"; exit 1; }
+          [ -n "${R2_ACCOUNT_ID:-}" ] || { echo "::error::缺少 secret R2_ACCOUNT_ID"; exit 1; }
+          [ -n "${R2_ACCESS_KEY_ID:-}" ] || { echo "::error::缺少 secret R2_ACCESS_KEY_ID"; exit 1; }
+          [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || { echo "::error::缺少 secret R2_SECRET_ACCESS_KEY"; exit 1; }
 
-          SSH_PORT="${CN_PORT:-22}"
-          REMOTE_USER="${CN_USER:-root}"
-          REMOTE_DIR="${CN_INCOMING:-/data/jishi/incoming}"
+          BUCKET="${R2_BUCKET:-jishi}"
+          PREFIX="${R2_PREFIX:-docker}"
+          PREFIX="${PREFIX%/}"
+          R2_KEY="${PREFIX}/${PAN_FILE_NAME}"
+          echo "R2_KEY=$R2_KEY" >> "$GITHUB_ENV"
 
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          export RCLONE_CONFIG_R2_TYPE=s3
+          export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+          export RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          export RCLONE_CONFIG_R2_REGION=auto
+          export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
 
-          # 把 known_hosts 里也遮一下
-          echo "::add-mask::${CN_HOST}"
-
-          # 扫描 host key（不校验指纹，容器里一次性 SSH 安全）
-          ssh-keyscan -p "$SSH_PORT" "$CN_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-
-          # 阶段回调：开始跨境传输
+          # 阶段回调：开始上传 R2
           if [ -n "$CALLBACK_URL" ]; then
             curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
               -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"transferring\",\"message\":\"海外打包完成，正在跨境 rsync 推送国内服务器…\",\"projectType\":\"docker\"}" || true
+              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"uploading\",\"message\":\"已打包完成，正在上传 R2…\",\"projectType\":\"docker\"}" || true
           fi
 
-          echo "📡 rsync 推送 → ${REMOTE_USER}@${CN_HOST}:${SSH_PORT}:${REMOTE_DIR}"
-          echo "   文件: $PAN_FILE_NAME (${SIZE_BYTES} bytes)"
-
-          # 国内服务器上创建收件目录（mkdir -p）
-          ssh -i ~/.ssh/id_ed25519 -p "$SSH_PORT" -o StrictHostKeyChecking=no \
-            "${REMOTE_USER}@${CN_HOST}" "mkdir -p '${REMOTE_DIR}'"
-
-          # rsync：启用 --partial 支持断点续传，最多重试 5 次（跨境网络抖动常见）
+          echo "📤 上传 → r2:${BUCKET}/${R2_KEY} (${SIZE_BYTES} bytes)"
           SUCCESS=0
           for i in 1 2 3 4 5; do
-            echo "🔄 rsync attempt $i/5 ..."
-            rsync -avz --partial --inplace --timeout=120 --progress \
-              -e "ssh -i ~/.ssh/id_ed25519 -p ${SSH_PORT} -o StrictHostKeyChecking=no" \
-              "$LOCAL_FILE" \
-              "${LOCAL_FILE}.meta.json" \
-              "${REMOTE_USER}@${CN_HOST}:${REMOTE_DIR}/" && SUCCESS=1 && break
-            echo "⚠️  rsync interrupted on attempt $i"
+            echo "🔄 rclone attempt $i/5 ..."
+            if rclone copyto "$LOCAL_FILE" "r2:${BUCKET}/${R2_KEY}" \
+              --s3-no-check-bucket \
+              --s3-chunk-size 64M --s3-upload-cutoff 64M --s3-upload-concurrency 4 \
+              --transfers 1 --retries 3 --low-level-retries 10 --timeout 10m --progress; then
+              SUCCESS=1
+              break
+            fi
+            echo "⚠️  R2 上传中断 attempt $i"
             sleep 10
           done
+          [ "$SUCCESS" -eq 1 ] || { echo "::error::R2 上传重试 5 次均失败"; exit 1; }
 
-          [ "$SUCCESS" -eq 1 ] || { echo "::error::rsync 重试 5 次均失败，跨境传输失败"; exit 1; }
+          # 校验远端对象大小
+          REMOTE_BYTES=$(rclone lsjson --stat "r2:${BUCKET}/${R2_KEY}" 2>/dev/null | jq -r '.Size // empty' || true)
+          if [ -z "$REMOTE_BYTES" ]; then
+            REMOTE_BYTES=$(rclone lsl "r2:${BUCKET}/${R2_KEY}" 2>/dev/null | awk 'NR==1 {print $1}' || true)
+          fi
+          echo "远端大小: ${REMOTE_BYTES:-unknown} bytes / 本地: ${SIZE_BYTES} bytes"
+          [ "$REMOTE_BYTES" = "$SIZE_BYTES" ] || { echo "::error::R2 对象大小与本地不一致"; exit 1; }
 
-          # 推送完成后立即删除 Runner 本地 .tar，释放磁盘（虽然 Runner 跑完会销毁，但早删更稳）
           rm -f "$LOCAL_FILE" "${LOCAL_FILE}.meta.json"
-
-          echo "✅ 跨境传输完成"
+          echo "✅ R2 上传完成: $R2_KEY"
 
       # ============================================================
-      # 步骤 6（新）：通知国内分发 Worker 启动多网盘上传
+      # 步骤 6（新）：回调后端（R2 完成）
       # ============================================================
 
-      - name: 6. 通知国内分发 Worker + 回调后端
+      - name: 6. 回调后端（R2 完成）
         env:
-          CN_WORKER_WEBHOOK: ${{ secrets.CN_WORKER_WEBHOOK }}
-          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
+          [ -n "${CALLBACK_URL:-}" ] || { echo "⚠️ 未配置 callback_url，跳过回调"; exit 0; }
 
-          # --- 6a. 通知国内 Worker ---
-          if [ -n "${CN_WORKER_WEBHOOK:-}" ]; then
-            echo "📤 通知国内分发 Worker: $CN_WORKER_WEBHOOK"
-            # meta.json 已在步骤 4 生成到 Runner 磁盘，此处重新拼装（因为步骤 5 已删除原文件）
-            DISPATCH_PAYLOAD=$(jq -n \
-              --arg task_id "$TASK_ID" \
-              --arg full_image "$FULL_IMAGE" \
-              --arg source_name "$SOURCE" \
-              --arg version "$VERSION" \
-              --arg arch "${ARCH:-}" \
-              --arg file_name "$PAN_FILE_NAME" \
-              --arg category_dir "$CATEGORY_DIR" \
-              --argjson size "${SIZE_BYTES:-0}" \
-              --arg sha256 "${SHA256_SUM:-}" \
-              --arg md5 "${MD5_SUM:-}" \
-              --arg docker_digest "$CHECKSUM_VALUE" \
-              '{task_id:$task_id, full_image:$full_image, source_name:$source_name,
-                version:$version, arch:$arch, file_name:$file_name, category_dir:$category_dir,
-                file_size:$size, sha256:$sha256, md5:$md5, docker_digest:$docker_digest,
-                dispatched_from:"github_actions", dispatched_at:(now|floor)}')
+          CALLBACK_PAYLOAD=$(jq -n \
+            --arg taskId "$TASK_ID" \
+            --arg status "ready" \
+            --arg sourceName "$SOURCE" \
+            --arg version "$VERSION" \
+            --arg arch "${ARCH:-}" \
+            --arg r2Key "${R2_KEY:-}" \
+            --arg fileName "$PAN_FILE_NAME" \
+            --argjson fileSize "${SIZE_BYTES:-0}" \
+            --arg sha256 "${SHA256_SUM:-}" \
+            --arg md5 "${MD5_SUM:-}" \
+            --arg dockerDigest "${CHECKSUM_VALUE:-}" \
+            '{taskId:$taskId, status:$status, sourceName:$sourceName,
+              version:$version, arch:$arch, r2Key:$r2Key, fileName:$fileName,
+              fileSize:$fileSize, sha256:$sha256, md5:$md5, dockerDigest:$dockerDigest,
+              message:"已上传 R2"}')
 
-            WEBHOOK_CODE=0
-            if [ -n "${WEBHOOK_TOKEN:-}" ]; then
-              curl -sS -f -o /dev/null -w "%{http_code}" \
-                -H "Authorization: Bearer ${WEBHOOK_TOKEN}" \
-                -H "Content-Type: application/json" \
-                -d "$DISPATCH_PAYLOAD" \
-                "${CN_WORKER_WEBHOOK}/api/internal/dispatch" || WEBHOOK_CODE=$?
-            else
-              curl -sS -f -o /dev/null -w "%{http_code}" \
-                -H "Content-Type: application/json" \
-                -d "$DISPATCH_PAYLOAD" \
-                "${CN_WORKER_WEBHOOK}/api/internal/dispatch" || WEBHOOK_CODE=$?
-            fi
-            echo "Webhook 响应: HTTP ${WEBHOOK_CODE}"
-          else
-            echo "⚠️  未配置 CN_WORKER_WEBHOOK，跳过 webhook 通知。国内 Worker 需自行轮询收件目录。"
-          fi
-
-          # --- 6b. 回调后端（状态: transferred_to_cn）---
-          # 注意：方案 A 中 GitHub Actions 不再能拿到 drive_fid / pan_path，
-          # 这些字段由国内 Worker 上传网盘后回传后端
-          if [ -n "$CALLBACK_URL" ]; then
-            CALLBACK_PAYLOAD=$(jq -n \
-              --arg taskId "$TASK_ID" \
-              --arg status "transferred_to_cn" \
-              --arg projectType "docker" \
-              --arg sourceName "$SOURCE" \
-              --arg version "$VERSION" \
-              --arg arch "${ARCH:-}" \
-              --arg checksumAlgo "docker-manifest-digest" \
-              --arg checksumValue "${CHECKSUM_VALUE:-}" \
-              --arg packFormat "tar" \
-              --argjson sizeBytes "${SIZE_BYTES:-0}" \
-              '{taskId:$taskId, status:$status, projectType:$projectType,
-                sourceName:$sourceName, version:$version, arch:$arch,
-                checksumAlgo:$checksumAlgo, checksumValue:$checksumValue,
-                packFormat:$packFormat, sizeBytes:$sizeBytes,
-                message:"镜像已推送国内轻量云，等待国内 Worker 上传网盘"}')
-            curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+          for i in 1 2 3; do
+            if curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
               -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "$CALLBACK_PAYLOAD" || true
-            echo "✅ 后端回调完成（状态: transferred_to_cn）"
-          fi
+              -d "$CALLBACK_PAYLOAD"; then
+              echo "✅ 后端回调完成（status: ready）"
+              exit 0
+            fi
+            echo "⚠️  回调失败，重试 $i/3"
+            sleep 5
+          done
+
+          echo "::error::后端回调 3 次均失败"
+          exit 1
 
       # ============================================================
       # 步骤 7（新）：失败回传（兜底）
@@ -427,9 +396,24 @@ jobs:
         shell: bash
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
+          # 尽力清理可能上传了一半的 R2 对象
+          if [ -n "${R2_KEY:-}" ] && [ -n "${R2_ACCOUNT_ID:-}" ]; then
+            export RCLONE_CONFIG_R2_TYPE=s3
+            export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+            export RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+            export RCLONE_CONFIG_R2_REGION=auto
+            export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+            export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+            rclone deletefile "r2:${R2_BUCKET:-jishi}/${R2_KEY}" 2>/dev/null || true
+          fi
+
           [ -n "${CALLBACK_URL:-}" ] || exit 0
-          HINT="${FAIL_HINT:-后台任务失败：Docker 镜像拉取/压缩/跨境传输中断，请查看 Actions 日志}"
+          HINT="${FAIL_HINT:-后台任务失败：Docker 镜像拉取/压缩/R2 上传中断，请查看 Actions 日志}"
           curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
             -d "$(jq -n --arg t "${TASK_ID:-manual}" --arg e "$HINT" '{taskId:$t,status:"failed",error:$e}')" || true
