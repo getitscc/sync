@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -54,10 +55,12 @@ class XunleiError(RuntimeError):
 
 
 class Xunlei:
-    def __init__(self) -> None:
-        self.refresh_token = (os.getenv("XUNLEI_REFRESH_TOKEN") or "").strip()
+    def __init__(self, refresh_token: str = "") -> None:
+        self.refresh_token = (refresh_token or os.getenv("XUNLEI_REFRESH_TOKEN") or "").strip()
         if not self.refresh_token:
             raise XunleiError("缺少环境变量 XUNLEI_REFRESH_TOKEN")
+        # 迅雷会轮换 refresh_token，轮换后通过该回调回写持久化存储
+        self.on_refresh = None
         self.client_id = (os.getenv("XUNLEI_CLIENT_ID") or DEFAULT_CLIENT_ID).strip()
         self.device_id = (os.getenv("XUNLEI_DEVICE_ID") or "").strip() or hashlib.md5(
             f"{self.refresh_token}xlrefresh".encode()
@@ -87,13 +90,20 @@ class Xunlei:
         if not token:
             # 不要把 access_token / refresh_token 打进日志
             safe = {k: data.get(k) for k in ("error", "error_description", "message", "code") if data.get(k)}
+            body = re.sub(r"a1\.[A-Za-z0-9._-]+", "a1.***", resp.text[:300])
             raise XunleiError(
-                f"refresh_token 换取 access_token 失败（HTTP {resp.status_code}）: {safe or '响应无 access_token'}"
+                f"refresh_token 换取 access_token 失败（HTTP {resp.status_code}）: "
+                f"{safe or body or '响应为空'}"
             )
         new_refresh = info.get("refresh_token")
         if new_refresh and new_refresh != self.refresh_token:
-            log("[XUNLEI] 注意：refresh_token 已轮换；若下次运行鉴权失败，请重新从浏览器获取并更新 GitHub Secret")
+            log("[XUNLEI] refresh_token 已轮换，正在回写持久化存储")
             self.refresh_token = new_refresh
+            if self.on_refresh:
+                try:
+                    self.on_refresh(new_refresh)
+                except Exception as e:  # noqa: BLE001
+                    log(f"[XUNLEI] 警告：轮换 token 回写失败: {e}")
         self._access_token = token
         self._access_exp = time.time() + max(60, int(info.get("expires_in", 3600)) - 60)
         return token
@@ -325,13 +335,75 @@ def _resolve_folder(xl: "Xunlei", folder: str) -> str:
     return parent_id
 
 
+def _token_store_url(callback_url: str) -> str:
+    """从回调地址推导 Worker 的轮换 token 存储接口。"""
+    if "/api/callback/" in callback_url:
+        base = callback_url.split("/api/callback/", 1)[0]
+        return base.rstrip("/") + "/api/internal/token/xunlei_refresh"
+    return ""
+
+
+def _load_remote_token(args) -> str:
+    url = _token_store_url(args.callback_url or "")
+    if not url or not args.callback_secret:
+        return ""
+    try:
+        resp = httpx.get(
+            url, headers={"X-Callback-Secret": args.callback_secret}, timeout=15
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return str((data.get("data") or {}).get("value") or "").strip()
+    except Exception as e:  # noqa: BLE001
+        log(f"[XUNLEI] 读取轮换 token 失败: {e}")
+    return ""
+
+
+def _save_remote_token(args, value: str) -> None:
+    url = _token_store_url(args.callback_url or "")
+    if not url or not args.callback_secret:
+        return
+    try:
+        resp = httpx.post(
+            url,
+            headers={"X-Callback-Secret": args.callback_secret},
+            json={"value": value},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log(f"[XUNLEI] 警告：refresh_token 回写失败 HTTP {resp.status_code}")
+    except Exception as e:  # noqa: BLE001
+        log(f"[XUNLEI] 警告：refresh_token 回写失败: {e}")
+
+
 async def upload_xunlei(args) -> None:
-    token = (os.getenv("XUNLEI_REFRESH_TOKEN") or "").strip()
-    if not token:
+    env_token = (os.getenv("XUNLEI_REFRESH_TOKEN") or "").strip()
+    remote_token = await asyncio.to_thread(_load_remote_token, args)
+    candidates: list[str] = []
+    for token in (remote_token, env_token):
+        if token and token not in candidates:
+            candidates.append(token)
+    if not candidates:
         raise Skipped("未配置 XUNLEI_REFRESH_TOKEN")
 
     def work() -> None:
-        xl = Xunlei()
+        xl = None
+        last_error = None
+        # 优先使用 Worker 里轮换后的 token；失败再回退到 GitHub Secret 里的初始 token
+        for token in candidates:
+            try:
+                candidate = Xunlei(token)
+                candidate.on_refresh = lambda v: _save_remote_token(args, v)
+                candidate.access_token()
+                xl = candidate
+                break
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+        if xl is None:
+            raise last_error or XunleiError("迅雷鉴权失败")
+
+        # 首次跑通也把当前 token 存一份，后续不再依赖 GitHub Secret 是否过期
+        _save_remote_token(args, xl.refresh_token)
         # 新布局必须逐级解析 /images/{registry}/{image}，不能使用固定 parent_id
         xl.parent_id = _resolve_folder(xl, args.dir)
         size = os.path.getsize(args.file)
