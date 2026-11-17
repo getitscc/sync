@@ -1,21 +1,19 @@
-name: Docker Sync (R2 — Overseas Pull + R2 Upload)
+name: Docker Sync (R2 + 四网盘静默归档)
 
 # =====================================================
-# 当前链路：
-#   ✅ skopeo 拉取 + pigz 压缩
-#   ✅ rclone 直传 Cloudflare R2（不再经过国内服务器/网盘）
-#   ✅ 回调 Worker 写 D1，前端通过 /api/download/:id 下载
+# 数据面：拉取 → 打包 → R2 临时直链 → 四网盘 /docker/ 静默上传
+# 控制面：网盘目录分享链接由国内服务器/管理员通过 Worker API 维护
 #
-# 需要在仓库 Secrets 里配置：
-#   R2_ACCOUNT_ID        — Cloudflare 账号 ID
-#   R2_ACCESS_KEY_ID     — R2 API Token 的 Access Key ID
-#   R2_SECRET_ACCESS_KEY — R2 API Token 的 Secret Access Key
-#   R2_BUCKET            — 桶名（默认 jishi）
-#   R2_PREFIX            — 对象键前缀（默认 docker）
-#   CALLBACK_SECRET      — 与 Worker 的 WEBHOOK_SECRET 一致
+# 本工作流不生成任何网盘分享链接，只回传每个文件在每个网盘的上传结果。
 #
-# 本仓库只保留此 workflow。测试环境复用同一文件：
-#   同一个 jishi 桶，R2_PREFIX=docker-，callback_url 指向测试 Worker。
+# 需要 Secrets：
+#   R2_*                  Cloudflare R2 上传
+#   CALLBACK_SECRET       与 Worker 的 WEBHOOK_SECRET 一致
+#   QUARK_COOKIE          夸克网盘 Cookie
+#   BAIDU_ACCESS_TOKEN    百度网盘开放平台 access_token
+#   ALIYUN_REFRESH_TOKEN  阿里云盘 refresh_token
+#   XUNLEI_REFRESH_TOKEN  迅雷云盘 refresh_token
+#   XUNLEI_PARENT_ID      可选：迅雷 /docker 目录 ID；不填会自动查找/创建
 # =====================================================
 
 on:
@@ -25,7 +23,7 @@ on:
     inputs:
       source_name:
         description: '镜像名（可带 registry，如 ghcr.io/owner/repo）'
-        required: true
+        required: false
         default: 'nginx'
       version:
         description: '版本 / tag（留空默认 latest）'
@@ -35,8 +33,24 @@ on:
         description: '架构（linux/amd64、linux/arm/v7 或裸 amd64）'
         required: false
         default: 'linux/amd64'
-      profile_id:
-        description: '（兼容保留，当前链路不使用）账号 ID'
+      r2_enabled:
+        description: '是否上传 R2（true/false）'
+        required: false
+        default: 'true'
+      pan_providers:
+        description: '目标网盘（逗号分隔：quark,baidu,aliyun,xunlei）'
+        required: false
+        default: 'quark,baidu,aliyun,xunlei'
+      folder_path:
+        description: '网盘分享根目录（默认 /images）'
+        required: false
+        default: '/images'
+      pan_dir:
+        description: '可选：覆盖实际上传目录（默认 /images/{registry}/{image}）'
+        required: false
+        default: ''
+      pan_file_name:
+        description: '可选：覆盖网盘文件名（默认 {image}_{version}_linux-{arch}.tar.gz）'
         required: false
         default: ''
       task_id:
@@ -48,9 +62,8 @@ on:
         required: false
         default: ''
 
-# 并发控制：同一时间只跑 1 个 R2 上传任务，避免占满 Runner 磁盘与带宽
 concurrency:
-  group: r2-transfer
+  group: docker-transfer
   cancel-in-progress: false
 
 jobs:
@@ -59,33 +72,38 @@ jobs:
     timeout-minutes: 180
     steps:
       # ============================================================
-      # 步骤 1~4：参数解析 + 拉取打包（和原版完全一致，保留成熟逻辑）
+      # 步骤 1：参数解析
       # ============================================================
-
       - name: 1. 参数解析与镜像引用拼装
         id: params
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          CALLBACK_BASE_URL: ${{ secrets.CALLBACK_BASE_URL }}
           IN_SOURCE: ${{ github.event.client_payload.source_name || github.event.inputs.source_name }}
           IN_VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
           IN_ARCH: ${{ github.event.client_payload.arch || github.event.inputs.arch || 'linux/amd64' }}
-          IN_PROFILE: ${{ github.event.client_payload.profile_id || github.event.inputs.profile_id }}
+          IN_R2_ENABLED: ${{ github.event.client_payload.r2_enabled || github.event.inputs.r2_enabled || 'true' }}
+          IN_PAN_PROVIDERS: ${{ github.event.client_payload.pan_providers || github.event.inputs.pan_providers || 'quark,baidu,aliyun,xunlei' }}
+          IN_FOLDER_PATH: ${{ github.event.client_payload.folder_path || github.event.inputs.folder_path || '/images' }}
+          IN_PAN_DIR: ${{ github.event.client_payload.pan_dir || github.event.inputs.pan_dir }}
+          IN_PAN_FILE_NAME: ${{ github.event.client_payload.pan_file_name || github.event.inputs.pan_file_name }}
           IN_TASK: ${{ github.event.client_payload.task_id || github.event.inputs.task_id }}
           IN_CALLBACK: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
         run: |
           set -euo pipefail
+
           SOURCE="$IN_SOURCE"; VERSION="$IN_VERSION"; ARCH="$IN_ARCH"
           [ -n "$SOURCE" ] || { echo "::error::缺少 source_name"; exit 1; }
           VERSION=$(printf '%s' "$VERSION" | tr -d '\r' | xargs || true)
           SOURCE=$(printf '%s' "$SOURCE" | tr -d '\r' | xargs)
+          SOURCE=$(printf '%s' "$SOURCE" | tr -s '/')
+          SOURCE="${SOURCE#/}"; SOURCE="${SOURCE%/}"
 
-          # 镜像名里可能自带 :tag
           if [ -z "$VERSION" ] && [[ "$SOURCE" == *:* ]]; then
             VERSION="${SOURCE##*:}"; SOURCE="${SOURCE%%:*}"
           fi
           [ -n "$VERSION" ] || VERSION="latest"
 
-          # 带 registry 前缀（首段含点）就用原样，否则补 docker.io
           if [[ "$SOURCE" == *"/"* ]] && [[ "${SOURCE%%/*}" == *.* ]]; then
             FULL_REPO="$SOURCE"
           elif [[ "$SOURCE" == *"/"* ]]; then
@@ -94,21 +112,74 @@ jobs:
             FULL_REPO="docker.io/library/$SOURCE"
           fi
           FULL_IMAGE="${FULL_REPO}:${VERSION}"
+          case "/$FULL_REPO/" in
+            *"//"*) echo "::error::镜像名含空路径段（多余斜杠）: $FULL_REPO"; exit 1 ;;
+          esac
+          [[ "$FULL_REPO" =~ ^[a-z0-9._/-]+$ ]] || { echo "::error::镜像名含非法字符: $FULL_REPO"; exit 1; }
 
-          # 架构拆 os/arch/variant（skopeo 要分开传）
           if [[ "$ARCH" == *"/"* ]]; then ARCH_OS="${ARCH%%/*}"; ARCH_REST="${ARCH#*/}"; else ARCH_OS="linux"; ARCH_REST="$ARCH"; fi
           ARCH_NAME="${ARCH_REST%%/*}"; ARCH_VARIANT=""
           [[ "$ARCH_REST" == */* ]] && ARCH_VARIANT="${ARCH_REST#*/}"
-          ARCH_SAFE="${ARCH//\//-}"
 
-          CATEGORY_DIR="${SOURCE##*/}"
-          SAFE_NAME=$(printf '%s' "$SOURCE" | tr '/' '-')
-          TAR_NAME="${SAFE_NAME}_${VERSION}_${ARCH_SAFE}.tar"
-          # 实际跨境传输的是 pigz 压缩后的 .tar.gz，文件名必须如实反映内容
-          PAN_FILE_NAME="${TAR_NAME}.gz"
+          # registry → 网盘顶层 label；第三层镜像目录名
+          REGISTRY="docker.io"; REPO_PATH="$FULL_REPO"
+          if [[ "$FULL_REPO" == */* ]]; then
+            FIRST="${FULL_REPO%%/*}"
+            if [[ "$FIRST" == *.* ]]; then REGISTRY="$FIRST"; REPO_PATH="${FULL_REPO#*/}"; fi
+          fi
+          case "$REGISTRY" in
+            docker.io)                REGISTRY_LABEL="Docker Hub" ;;
+            ghcr.io)                  REGISTRY_LABEL="GHCR" ;;
+            registry.k8s.io)          REGISTRY_LABEL="K8s" ;;
+            nvcr.io)                  REGISTRY_LABEL="NVIDIA" ;;
+            gcr.io)                   REGISTRY_LABEL="Google" ;;
+            quay.io)                  REGISTRY_LABEL="Quay" ;;
+            mcr.microsoft.com)         REGISTRY_LABEL="Microsoft" ;;
+            docker.elastic.co)        REGISTRY_LABEL="Elastic" ;;
+            docker.n8n.io)            REGISTRY_LABEL="n8n" ;;
+            skywalking.docker.scarf.sh) REGISTRY_LABEL="SkyWalking" ;;
+            *)                        REGISTRY_LABEL="$REGISTRY" ;;
+          esac
+          if [[ "$REGISTRY" == "docker.io" && "$REPO_PATH" == library/* ]]; then
+            IMAGE_DIR="${REPO_PATH#library/}"
+          else
+            IMAGE_DIR="${REPO_PATH//\//-}"
+            NS="${REPO_PATH%%/*}"; NAME="${REPO_PATH##*/}"
+            # elasticsearch/elasticsearch 这类同名仓库不重复拼 namespace
+            if [[ "$REPO_PATH" == */* && "$NS" == "$NAME" ]]; then IMAGE_DIR="$NAME"; fi
+          fi
+          IMAGE_DIR="${IMAGE_DIR// /-}"
+
+          PAN_DIR="${IN_PAN_DIR:-/images/${REGISTRY_LABEL}/${IMAGE_DIR}}"
+          case "$PAN_DIR" in
+            /*) ;;
+            *) PAN_DIR="/$PAN_DIR" ;;
+          esac
+          PAN_FILE_NAME="${IN_PAN_FILE_NAME:-${IMAGE_DIR}_${VERSION}_${ARCH_OS}-${ARCH_NAME}${ARCH_VARIANT:+-${ARCH_VARIANT}}.tar.gz}"
+          TAR_NAME="${PAN_FILE_NAME%.gz}"
+          CATEGORY_DIR="${IMAGE_DIR}"
+
+          R2_ENABLED="$(printf '%s' "${IN_R2_ENABLED:-true}" | tr -d '\r' | xargs || true)"
+          [ "$R2_ENABLED" = "true" ] || R2_ENABLED="false"
+          DO_R2="true"
+          [ "$R2_ENABLED" = "true" ] || DO_R2="false"
+
+          PAN_PROVIDERS_LIST="$(printf '%s' "${IN_PAN_PROVIDERS:-}" | tr -d '\r' | xargs || true)"
+          FOLDER_PATH="$(printf '%s' "${IN_FOLDER_PATH:-/images}" | tr -d '\r' | xargs || true)"
+          FOLDER_PATH="${FOLDER_PATH:-/images}"
+          case "$FOLDER_PATH" in
+            /*) ;;
+            *) FOLDER_PATH="/$FOLDER_PATH" ;;
+          esac
+
+          DO_PANS="true"
+          [ -n "$PAN_PROVIDERS_LIST" ] || DO_PANS="false"
 
           TASK_ID="${IN_TASK:-manual_$(date +%s)}"
           CALLBACK_URL="$IN_CALLBACK"
+          if [ -n "${CALLBACK_BASE_URL:-}" ]; then
+            CALLBACK_URL="${CALLBACK_BASE_URL%/}/api/callback/gh"
+          fi
 
           {
             echo "SOURCE=$SOURCE"
@@ -119,21 +190,42 @@ jobs:
             echo "ARCH_NAME=$ARCH_NAME"
             echo "ARCH_VARIANT=$ARCH_VARIANT"
             echo "CATEGORY_DIR=$CATEGORY_DIR"
+            echo "REGISTRY_LABEL=$REGISTRY_LABEL"
+            echo "IMAGE_DIR=$IMAGE_DIR"
+            echo "PAN_DIR=$PAN_DIR"
             echo "TAR_NAME=$TAR_NAME"
             echo "PAN_FILE_NAME=$PAN_FILE_NAME"
+            echo "R2_ENABLED=$R2_ENABLED"
+            echo "DO_R2=$DO_R2"
+            echo "DO_PANS=$DO_PANS"
+            echo "PAN_PROVIDERS_LIST=$PAN_PROVIDERS_LIST"
+            echo "FOLDER_PATH=$FOLDER_PATH"
             echo "TASK_ID=$TASK_ID"
             echo "CALLBACK_URL=$CALLBACK_URL"
           } >> "$GITHUB_ENV"
-          echo "📋 $FULL_IMAGE | $ARCH"
+
+          {
+            echo "do_r2=$DO_R2"
+            echo "do_pans=$DO_PANS"
+            echo "pan_providers=$PAN_PROVIDERS_LIST"
+            echo "folder_path=$FOLDER_PATH"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "📋 $FULL_IMAGE | $ARCH | providers=$PAN_PROVIDERS_LIST | dir=$PAN_DIR"
 
           if [ -n "$CALLBACK_URL" ]; then
-            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
               -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"prepared\",\"message\":\"参数解析完成，准备拉取\",\"projectType\":\"docker\"}" || true
+              -d "$(jq -n --arg t "$TASK_ID" '{taskId:$t,stage:"prepared",stage_msg:"参数解析完成，准备拉取"}')" || echo "000")
+            echo "回调 prepared: HTTP $CODE"
+            [ "$CODE" = "200" ] || echo "::warning::阶段回调失败（HTTP $CODE）"
           fi
 
-      - name: 2. 安装工具链（含 rclone）
+      # ============================================================
+      # 步骤 2~4：拉取与打包
+      # ============================================================
+      - name: 2. 安装工具链
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq skopeo curl jq pigz rclone
@@ -146,7 +238,6 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # 提前登录，确保私有或受限镜像也能正常 inspect 体积
           if [[ "$FULL_IMAGE" == ghcr.io/* ]] && [ -n "${GHCR_TOKEN:-}" ]; then
             echo "$GHCR_TOKEN" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
           fi
@@ -163,7 +254,6 @@ jobs:
           INFO=$(skopeo inspect "${PLATFORM[@]}" "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
           SIZE=$(echo "$INFO" | jq -r '[.LayersData[]?.Size // 0] | add // 0' 2>/dev/null || echo 0)
 
-          # 选择可用空间最大的分区（对比 /mnt 与 /），规避 /tmp 的分区大小或 Quota 限制
           MNT_FREE=$(df -m /mnt 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
           ROOT_FREE=$(df -m / | awk 'NR==2 {print $4}')
           if [ "$MNT_FREE" -gt "$ROOT_FREE" ]; then
@@ -174,7 +264,6 @@ jobs:
             WORK_FREE="$ROOT_FREE"
           fi
 
-          # 预估峰值占用：未压缩 tar + pigz 压缩过程双份占用
           EST_MB=$(( SIZE * 3 / 1024 / 1024 ))
           echo "压缩层总大小: $((SIZE / 1024 / 1024))MB | 预估峰值需求: ~${EST_MB}MB | 可用: ${WORK_FREE}MB"
 
@@ -201,12 +290,13 @@ jobs:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
-          # 阶段回调：开始拉取
           if [ -n "$CALLBACK_URL" ]; then
-            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
               -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"pulling\",\"message\":\"正在跨海拉取并压缩镜像…\",\"projectType\":\"docker\"}" || true
+              -d "$(jq -n --arg t "$TASK_ID" '{taskId:$t,stage:"pulling",stage_msg:"正在跨海拉取镜像…"}')" || echo "000")
+            echo "回调 pulling: HTTP $CODE"
+            [ "$CODE" = "200" ] || echo "::warning::阶段回调失败（HTTP $CODE）"
           fi
 
           PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
@@ -215,15 +305,20 @@ jobs:
           LOCAL_TAR="${WORK_DIR}/${TAR_NAME}"
           LOCAL_FILE="${LOCAL_TAR}.gz"
           skopeo copy --tmpdir "$TMPDIR" "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
-
-          # 立即清空 skopeo 临时缓存，为接下来的 pigz 压缩腾出最大磁盘空间
           rm -rf "${TMPDIR:?}"/*
 
-          # pigz 压缩（跨境传输量减少约 60%~80%），产物就是 .tar.gz，不再改名
+          if [ -n "$CALLBACK_URL" ]; then
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$(jq -n --arg t "$TASK_ID" '{taskId:$t,stage:"packing",stage_msg:"正在压缩打包镜像…"}')" || echo "000")
+            echo "回调 packing: HTTP $CODE"
+            [ "$CODE" = "200" ] || echo "::warning::阶段回调失败（HTTP $CODE）"
+          fi
+
           pigz -6 -p 4 "$LOCAL_TAR"
           [ -f "$LOCAL_FILE" ] || { echo "::error::pigz 未生成 $LOCAL_FILE"; exit 1; }
 
-          # 平台 manifest digest（多架构镜像下取对应 os/arch/variant 的平台 digest）
           RAW_MANIFEST=$(skopeo inspect --raw "docker://${FULL_IMAGE}" 2>/dev/null || echo '{}')
           MEDIA_TYPE=$(echo "$RAW_MANIFEST" | jq -r '.mediaType // empty' 2>/dev/null || true)
           DIGEST=""
@@ -241,12 +336,10 @@ jobs:
             exit 1
           fi
 
-          # 额外算 SHA256 + MD5（对压缩后的 .tar.gz 计算，供前端校验）
           SHA256_SUM=$(sha256sum "$LOCAL_FILE" | awk '{print $1}')
           MD5_SUM=$(md5sum "$LOCAL_FILE" | awk '{print $1}')
           SIZE_BYTES=$(stat -c%s "$LOCAL_FILE")
 
-          # 写入元数据描述文件（R2 上传与回调排查用）
           jq -n \
             --arg task_id "$TASK_ID" \
             --arg full_image "$FULL_IMAGE" \
@@ -279,10 +372,10 @@ jobs:
           echo "digest=$DIGEST sha256=$SHA256_SUM size=${SIZE_BYTES}B"
 
       # ============================================================
-      # 步骤 5（新）：rclone 直传 Cloudflare R2
+      # 步骤 5~6：R2 临时直链（前端可先下载）
       # ============================================================
-
       - name: 5. 上传至 Cloudflare R2
+        if: steps.params.outputs.do_r2 == 'true'
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
@@ -309,12 +402,13 @@ jobs:
           export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
           export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
 
-          # 阶段回调：开始上传 R2
           if [ -n "$CALLBACK_URL" ]; then
-            curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
               -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "{\"taskId\":\"$TASK_ID\",\"stage\":\"uploading\",\"message\":\"已打包完成，正在上传 R2…\",\"projectType\":\"docker\"}" || true
+              -d "$(jq -n --arg t "$TASK_ID" '{taskId:$t,stage:"uploading_r2",stage_msg:"已打包完成，正在上传 R2…"}')" || echo "000")
+            echo "回调 uploading_r2: HTTP $CODE"
+            [ "$CODE" = "200" ] || echo "::warning::阶段回调失败（HTTP $CODE）"
           fi
 
           echo "📤 上传 → r2:${BUCKET}/${R2_KEY} (${SIZE_BYTES} bytes)"
@@ -333,7 +427,6 @@ jobs:
           done
           [ "$SUCCESS" -eq 1 ] || { echo "::error::R2 上传重试 5 次均失败"; exit 1; }
 
-          # 校验远端对象大小
           REMOTE_BYTES=$(rclone lsjson --stat "r2:${BUCKET}/${R2_KEY}" 2>/dev/null | jq -r '.Size // empty' || true)
           if [ -z "$REMOTE_BYTES" ]; then
             REMOTE_BYTES=$(rclone lsl "r2:${BUCKET}/${R2_KEY}" 2>/dev/null | awk 'NR==1 {print $1}' || true)
@@ -341,57 +434,123 @@ jobs:
           echo "远端大小: ${REMOTE_BYTES:-unknown} bytes / 本地: ${SIZE_BYTES} bytes"
           [ "$REMOTE_BYTES" = "$SIZE_BYTES" ] || { echo "::error::R2 对象大小与本地不一致"; exit 1; }
 
-          rm -f "$LOCAL_FILE" "${LOCAL_FILE}.meta.json"
+          echo "R2_UPLOAD_OK=1" >> "$GITHUB_ENV"
           echo "✅ R2 上传完成: $R2_KEY"
 
-      # ============================================================
-      # 步骤 6（新）：回调后端（R2 完成）
-      # ============================================================
-
-      - name: 6. 回调后端（R2 完成）
+      - name: 6. 回调 R2 直链
+        if: steps.params.outputs.do_r2 == 'true'
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: |
           set -euo pipefail
           [ -n "${CALLBACK_URL:-}" ] || { echo "⚠️ 未配置 callback_url，跳过回调"; exit 0; }
 
-          CALLBACK_PAYLOAD=$(jq -n \
+          PAYLOAD=$(jq -n \
             --arg taskId "$TASK_ID" \
-            --arg status "ready" \
-            --arg sourceName "$SOURCE" \
-            --arg version "$VERSION" \
-            --arg arch "${ARCH:-}" \
+            --arg status "r2_ready" \
             --arg r2Key "${R2_KEY:-}" \
             --arg fileName "$PAN_FILE_NAME" \
             --argjson fileSize "${SIZE_BYTES:-0}" \
             --arg sha256 "${SHA256_SUM:-}" \
             --arg md5 "${MD5_SUM:-}" \
             --arg dockerDigest "${CHECKSUM_VALUE:-}" \
-            '{taskId:$taskId, status:$status, sourceName:$sourceName,
-              version:$version, arch:$arch, r2Key:$r2Key, fileName:$fileName,
-              fileSize:$fileSize, sha256:$sha256, md5:$md5, dockerDigest:$dockerDigest,
-              message:"已上传 R2"}')
+            '{taskId:$taskId, status:$status, r2Key:$r2Key, fileName:$fileName,
+              fileSize:$fileSize, sha256:$sha256, md5:$md5, dockerDigest:$dockerDigest}')
 
           for i in 1 2 3; do
-            if curl -sS -o /dev/null -f -X POST "$CALLBACK_URL" \
+            RESP=$(curl -sS -w "\n%{http_code}" -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
               -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "$CALLBACK_PAYLOAD"; then
-              echo "✅ 后端回调完成（status: ready）"
-              exit 0
-            fi
-            echo "⚠️  回调失败，重试 $i/3"
+              -d "$PAYLOAD" || true)
+            CODE=$(printf '%s' "$RESP" | tail -n1)
+            BODY=$(printf '%s' "$RESP" | sed '$d')
+            echo "回调 r2_ready: HTTP $CODE"
+            [ -n "$BODY" ] && echo "响应: $BODY"
+            [ "$CODE" = "200" ] && { echo "R2_READY_OK=1" >> "$GITHUB_ENV"; exit 0; }
+            echo "⚠️  回调失败（HTTP $CODE），重试 $i/3"
             sleep 5
           done
-
-          echo "::error::后端回调 3 次均失败"
+          echo "::error::R2 回调 3 次均失败"
           exit 1
 
       # ============================================================
-      # 步骤 7（新）：失败回传（兜底）
+      # 步骤 7：四网盘静默上传（只上传，不出链）
       # ============================================================
+      - name: 7. 静默上传到四大网盘固定目录
+        id: pans
+        if: always() && steps.params.outputs.do_pans == 'true'
+        continue-on-error: true
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
+          BAIDU_ACCESS_TOKEN: ${{ secrets.BAIDU_ACCESS_TOKEN }}
+          ALIYUN_REFRESH_TOKEN: ${{ secrets.ALIYUN_REFRESH_TOKEN }}
+          XUNLEI_REFRESH_TOKEN: ${{ secrets.XUNLEI_REFRESH_TOKEN }}
+          XUNLEI_CLIENT_ID: ${{ secrets.XUNLEI_CLIENT_ID }}
+          XUNLEI_DEVICE_ID: ${{ secrets.XUNLEI_DEVICE_ID }}
+          XUNLEI_PARENT_ID: ${{ secrets.XUNLEI_PARENT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CALLBACK_URL" ]; then
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$(jq -n --arg t "$TASK_ID" '{taskId:$t,stage:"uploading_pans",stage_msg:"R2 已就绪，正在静默归档到网盘目录…"}')" || echo "000")
+            echo "回调 uploading_pans: HTTP $CODE"
+            [ "$CODE" = "200" ] || echo "::warning::阶段回调失败（HTTP $CODE）"
+          fi
 
-      - name: 7. 失败回传（兜底）
+          python3 -m venv /tmp/pan-venv
+          /tmp/pan-venv/bin/pip install --quiet --disable-pip-version-check httpx oss2 boto3 aligo
+          /tmp/pan-venv/bin/python .github/scripts/pan_upload.py \
+            --file "$LOCAL_FILE" \
+            --name "$PAN_FILE_NAME" \
+            --dir "$PAN_DIR" \
+            --providers "$PAN_PROVIDERS_LIST" \
+            --output /tmp/pan-results.json
+          echo "results=$(cat /tmp/pan-results.json)" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 步骤 8：回传每文件每网盘归档结果
+      # ============================================================
+      - name: 8. 回调归档结果
+        if: always() && steps.params.outputs.do_pans == 'true'
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: |
+          set -euo pipefail
+          RESULTS='[]'
+          if [ -f /tmp/pan-results.json ] && jq -e . /tmp/pan-results.json >/dev/null 2>&1; then
+            RESULTS=$(cat /tmp/pan-results.json)
+          fi
+          [ -n "${CALLBACK_URL:-}" ] || { echo "⚠️ 未配置 callback_url，跳过归档回调"; exit 0; }
+
+          PAYLOAD=$(jq -n --arg taskId "$TASK_ID" --argjson results "$RESULTS" '{
+            taskId: $taskId,
+            status: "archive_done",
+            panResults: $results
+          }')
+
+          for i in 1 2 3; do
+            RESP=$(curl -sS -w "\n%{http_code}" -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Callback-Secret: $CALLBACK_SECRET" \
+              -d "$PAYLOAD" || true)
+            CODE=$(printf '%s' "$RESP" | tail -n1)
+            BODY=$(printf '%s' "$RESP" | sed '$d')
+            echo "回调 archive_done: HTTP $CODE"
+            [ -n "$BODY" ] && echo "响应: $BODY"
+            [ "$CODE" = "200" ] && { echo "ARCHIVE_SENT=1" >> "$GITHUB_ENV"; exit 0; }
+            echo "⚠️  回调失败（HTTP $CODE），重试 $i/3"
+            sleep 5
+          done
+          echo "::error::归档结果回调 3 次均失败"
+          exit 1
+
+      # ============================================================
+      # 步骤 9：失败回传（兜底）
+      # ============================================================
+      - name: 9. 失败回传（兜底）
         if: failure()
         shell: bash
         env:
@@ -401,8 +560,12 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          # 尽力清理可能上传了一半的 R2 对象
-          if [ -n "${R2_KEY:-}" ] && [ -n "${R2_ACCOUNT_ID:-}" ]; then
+          if [ "${ARCHIVE_SENT:-0}" = "1" ]; then
+            echo "归档结果已回传，忽略后续失败"
+            exit 0
+          fi
+
+          if [ "${R2_UPLOAD_OK:-0}" != "1" ] && [ -n "${R2_KEY:-}" ] && [ -n "${R2_ACCOUNT_ID:-}" ]; then
             export RCLONE_CONFIG_R2_TYPE=s3
             export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
             export RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
@@ -413,7 +576,19 @@ jobs:
           fi
 
           [ -n "${CALLBACK_URL:-}" ] || exit 0
-          HINT="${FAIL_HINT:-后台任务失败：Docker 镜像拉取/压缩/R2 上传中断，请查看 Actions 日志}"
-          curl -sS -o /dev/null -X POST "$CALLBACK_URL" \
+          RESULTS='[]'
+          if [ -f /tmp/pan-results.json ] && jq -e . /tmp/pan-results.json >/dev/null 2>&1; then
+            RESULTS=$(cat /tmp/pan-results.json)
+          fi
+          HINT="${FAIL_HINT:-后台任务失败：拉取/压缩/R2/网盘归档链路中断，请查看 Actions 日志}"
+          CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
-            -d "$(jq -n --arg t "${TASK_ID:-manual}" --arg e "$HINT" '{taskId:$t,status:"failed",error:$e}')" || true
+            -d "$(jq -n --arg t "${TASK_ID:-manual}" --arg e "$HINT" --argjson results "$RESULTS" '{taskId:$t,status:"failed",error:$e,panResults:$results}')" || echo "000")
+          echo "回调 failed: HTTP $CODE"
+          [ "$CODE" = "200" ] || echo "::warning::失败回调未送达（HTTP $CODE）"
+
+      - name: 10. 清理 Runner 临时文件
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${LOCAL_FILE:-}" ] && rm -f "$LOCAL_FILE" "${LOCAL_FILE}.meta.json" || true
