@@ -81,10 +81,19 @@ class Xunlei:
             },
         )
         data = resp.json() if resp.status_code < 400 else {}
-        info = data.get("data") or {}
+        # 迅雷有两种返回结构：直接平铺 {access_token,...} 或包一层 {data:{...}}
+        info = data.get("data") if isinstance(data.get("data"), dict) else data
         token = info.get("access_token")
         if not token:
-            raise XunleiError(f"refresh_token 换取 access_token 失败: {data.get('error') or data}")
+            # 不要把 access_token / refresh_token 打进日志
+            safe = {k: data.get(k) for k in ("error", "error_description", "message", "code") if data.get(k)}
+            raise XunleiError(
+                f"refresh_token 换取 access_token 失败（HTTP {resp.status_code}）: {safe or '响应无 access_token'}"
+            )
+        new_refresh = info.get("refresh_token")
+        if new_refresh and new_refresh != self.refresh_token:
+            log("[XUNLEI] 注意：refresh_token 已轮换；若下次运行鉴权失败，请重新从浏览器获取并更新 GitHub Secret")
+            self.refresh_token = new_refresh
         self._access_token = token
         self._access_exp = time.time() + max(60, int(info.get("expires_in", 3600)) - 60)
         return token
