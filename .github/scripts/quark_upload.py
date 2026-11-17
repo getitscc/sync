@@ -21,6 +21,8 @@ ALIST_IMAGE = os.getenv("ALIST_IMAGE", "xhofe/alist:latest")
 CONTAINER = "jishi-alist-quark"
 BASE = "http://127.0.0.1:5244"
 MOUNT = "/pan"
+# 移动标签（latest/stable/main）指向的内容会变，上传前先删旧文件
+MUTABLE_TAGS = {"latest", "stable", "main"}
 
 
 def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -105,7 +107,7 @@ def _mount_quark(token: str, cookie: str) -> None:
     time.sleep(3)
 
 
-def _upload(token: str, path: str, name: str, folder: str) -> None:
+def _upload(token: str, path: str, name: str, folder: str, version: str) -> None:
     dest_dir = f"{MOUNT}/{folder.strip('/')}"
     httpx.post(
         f"{BASE}/api/fs/mkdir",
@@ -113,6 +115,16 @@ def _upload(token: str, path: str, name: str, folder: str) -> None:
         json={"path": dest_dir},
         timeout=30,
     )
+    if version.strip().lower() in MUTABLE_TAGS:
+        try:
+            httpx.post(
+                f"{BASE}/api/fs/remove",
+                headers={"Authorization": token},
+                json={"dir": dest_dir, "names": [name]},
+                timeout=30,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     last = ""
     for _ in range(3):
@@ -149,7 +161,7 @@ async def upload_quark(args) -> None:
             token = _login()
             _mount_quark(token, cookie)
             log(f"[QUARK] 上传: {args.name} -> {args.dir}")
-            _upload(token, args.file, args.name, args.dir)
+            _upload(token, args.file, args.name, args.dir, args.version)
             log(f"[QUARK] 上传完成: {args.name}")
         finally:
             _docker("rm", "-f", CONTAINER, check=False)
