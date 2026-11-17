@@ -1,7 +1,7 @@
 name: Docker Sync (R2 + 四网盘静默归档)
 
 # =====================================================
-# 数据面：拉取 → 打包 → R2 临时直链 → 四网盘 /docker/ 静默上传
+# 数据面：拉取 → 打包 → R2 临时直链 → 四网盘 /images/ 层级目录静默上传
 # 控制面：网盘目录分享链接由国内服务器/管理员通过 Worker API 维护
 #
 # 本工作流不生成任何网盘分享链接，只回传每个文件在每个网盘的上传结果。
@@ -13,7 +13,8 @@ name: Docker Sync (R2 + 四网盘静默归档)
 #   BAIDU_ACCESS_TOKEN    百度网盘开放平台 access_token
 #   ALIYUN_REFRESH_TOKEN  阿里云盘 refresh_token
 #   XUNLEI_REFRESH_TOKEN  迅雷云盘 refresh_token
-#   XUNLEI_PARENT_ID      可选：迅雷 /docker 目录 ID；不填会自动查找/创建
+#   XUNLEI_CLIENT_ID      可选：迅雷网页端 client_id
+#   XUNLEI_DEVICE_ID      可选：不填会按 refresh_token 派生稳定设备号
 # =====================================================
 
 on:
@@ -71,6 +72,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
+      # ============================================================
+      # 步骤 0：检出仓库（运行时从 workflow 注释块解出内嵌脚本）
+      # ============================================================
+      - name: 0. 检出仓库
+        uses: actions/checkout@v4
+
       # ============================================================
       # 步骤 1：参数解析
       # ============================================================
@@ -488,7 +495,6 @@ jobs:
           XUNLEI_REFRESH_TOKEN: ${{ secrets.XUNLEI_REFRESH_TOKEN }}
           XUNLEI_CLIENT_ID: ${{ secrets.XUNLEI_CLIENT_ID }}
           XUNLEI_DEVICE_ID: ${{ secrets.XUNLEI_DEVICE_ID }}
-          XUNLEI_PARENT_ID: ${{ secrets.XUNLEI_PARENT_ID }}
         run: |
           set -euo pipefail
           if [ -n "$CALLBACK_URL" ]; then
@@ -502,12 +508,27 @@ jobs:
 
           python3 -m venv /tmp/pan-venv
           /tmp/pan-venv/bin/pip install --quiet --disable-pip-version-check httpx oss2 boto3 aligo
-          /tmp/pan-venv/bin/python .github/scripts/pan_upload.py \
+
+          # 从本 workflow 的注释块解出内嵌脚本，无需额外脚本目录
+          mkdir -p /tmp/jishi-pans
+          WORKFLOW_FILE="$GITHUB_WORKSPACE/.github/workflows/docker-sync.yml"
+          tr -d '\r' < "$WORKFLOW_FILE" \
+            | sed -n '/^# __PAN_PY_START__$/,/^# __PAN_PY_END__$/p' \
+            | sed '1d;$d' | sed 's/^# //' | sed 's/^#$//' > /tmp/jishi-pans/pan_upload.py
+          tr -d '\r' < "$WORKFLOW_FILE" \
+            | sed -n '/^# __XL_PY_START__$/,/^# __XL_PY_END__$/p' \
+            | sed '1d;$d' | sed 's/^# //' | sed 's/^#$//' > /tmp/jishi-pans/xunlei_upload.py
+
+          /tmp/pan-venv/bin/python /tmp/jishi-pans/pan_upload.py \
             --file "$LOCAL_FILE" \
             --name "$PAN_FILE_NAME" \
             --dir "$PAN_DIR" \
             --providers "$PAN_PROVIDERS_LIST" \
-            --output /tmp/pan-results.json
+            --output /tmp/pan-results.json \
+            --callback-url "$CALLBACK_URL" \
+            --callback-secret "$CALLBACK_SECRET" \
+            --task-id "$TASK_ID" \
+            --timeout 1800
           echo "results=$(cat /tmp/pan-results.json)" >> "$GITHUB_OUTPUT"
 
       # ============================================================
@@ -592,3 +613,961 @@ jobs:
         shell: bash
         run: |
           [ -n "${LOCAL_FILE:-}" ] && rm -f "$LOCAL_FILE" "${LOCAL_FILE}.meta.json" || true
+
+# ============================================================
+# 内嵌脚本：运行时从本文件注释块解出，不再需要额外脚本文件
+# ============================================================
+
+# __PAN_PY_START__
+# #!/usr/bin/env python3
+# # =============================================================
+# # pan_upload.py —— GitHub Actions 直传四大网盘固定目录
+# #
+# # 职责：只上传，不生成任何分享链接。目录分享链接由国内服务器/管理员
+# #       通过 Worker 的 /api/internal/folder-links 维护。
+# #
+# # 用法：
+# #   python3 pan_upload.py \
+# #     --file /path/to/file.tar.gz \
+# #     --name nginx_1.27_amd64.tar.gz \
+# #     --dir "/images/Docker Hub/nginx" \
+# #     --providers quark,baidu,aliyun,xunlei \
+# #     --output /tmp/pan-results.json \
+# #     --callback-url https://docker.getits.cc/api/callback/gh \
+# #     --task-id <Job ID> --timeout 1800
+# #
+# # 每个网盘完成/失败/跳过都会立即回调 pan_result，前端可实时看到原因；
+# # 未配置凭证的网盘会以 skipped + 具体缺少的变量名返回。
+# #
+# # 凭证（缺失的网盘会标记 skipped，不影响其他网盘）：
+# #   QUARK_COOKIE
+# #   BAIDU_ACCESS_TOKEN
+# #   ALIYUN_REFRESH_TOKEN
+# #   XUNLEI_REFRESH_TOKEN (+ 可选 XUNLEI_CLIENT_ID / XUNLEI_DEVICE_ID)
+# #
+# # 输出 JSON：[{"provider":"quark","status":"success","error":null}, ...]
+# # 日志全部写 stderr，stdout 只输出一行汇总，便于 Actions 捕获。
+# # =============================================================
+#
+# import argparse
+# import asyncio
+# import hashlib
+# import json
+# import os
+# import sys
+# import time
+# from pathlib import Path
+# from typing import Optional
+#
+# import httpx
+#
+# BLOCK_SIZE = 4 * 1024 * 1024
+# DEFAULT_UA = (
+#     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+#     "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+# )
+# QUARK_API = "https://drive-pc.quark.cn/1/clouddrive"
+# BAIDU_API = "https://pan.baidu.com/rest/2.0/xpan/file"
+# BAIDU_PCS = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2"
+#
+#
+# class PanError(RuntimeError):
+#     pass
+#
+#
+# def log(msg: str) -> None:
+#     print(msg, file=sys.stderr, flush=True)
+#
+#
+# def now_ms() -> int:
+#     return int(time.time() * 1000)
+#
+#
+# def normalize_dir(path: str) -> str:
+#     p = (path or "/images").strip()
+#     if not p.startswith("/"):
+#         p = "/" + p
+#     return p.rstrip("/") or "/"
+#
+#
+# def md5_block_list(path: str) -> list[str]:
+#     """百度上传用的 4MB 分块 MD5 列表。"""
+#     result: list[str] = []
+#     with open(path, "rb") as f:
+#         while True:
+#             block = f.read(BLOCK_SIZE)
+#             if not block:
+#                 break
+#             result.append(hashlib.md5(block).hexdigest())
+#     return result
+#
+#
+# # =============================================================
+# # 夸克网盘
+# # =============================================================
+#
+# def _quark_params(**extra) -> dict:
+#     params = {"pr": "ucpro", "fr": "pc", "uc_param_str": "", "__t": now_ms()}
+#     params.update(extra)
+#     return params
+#
+#
+# async def _quark_request(
+#     client: httpx.AsyncClient,
+#     method: str,
+#     path: str,
+#     params: dict,
+#     json_body: Optional[dict] = None,
+# ) -> dict:
+#     resp = await client.request(method, f"{QUARK_API}/{path}", params=params, json=json_body)
+#     if resp.status_code >= 400:
+#         raise PanError(f"夸克接口 HTTP {resp.status_code}: {resp.text[:200]}")
+#     data = resp.json()
+#     if data.get("status") != 200:
+#         raise PanError(f"夸克接口异常: {data.get('message') or data}")
+#     return data
+#
+#
+# async def _quark_ensure_folder(client: httpx.AsyncClient, folder: str) -> str:
+#     parent = "0"
+#     for part in [p for p in folder.strip("/").split("/") if p]:
+#         data = await _quark_request(
+#             client,
+#             "GET",
+#             "file/sort",
+#             _quark_params(pdir_fid=parent, _page=1, _size=200, _sort="file_name:asc"),
+#         )
+#         items = (data.get("data") or {}).get("list") or []
+#         hit = next((i for i in items if i.get("file_name") == part), None)
+#         if hit:
+#             parent = str(hit.get("fid"))
+#             continue
+#         created = await _quark_request(
+#             client,
+#             "POST",
+#             "file",
+#             _quark_params(),
+#             {"pdir_fid": parent, "file_name": part, "dir": True},
+#         )
+#         d = created.get("data") or {}
+#         fid = d.get("fid") or (d.get("file") or {}).get("fid")
+#         if not fid:
+#             raise PanError(f"夸克创建目录失败: {part}")
+#         parent = str(fid)
+#     return parent
+#
+#
+# def _quark_put_oss(path: str, auth: dict, bucket: str, object_key: str) -> None:
+#     try:
+#         import oss2
+#     except ImportError as e:
+#         raise PanError("缺少 oss2，请 pip install oss2") from e
+#
+#     ak = auth.get("access_key_id") or auth.get("AccessKeyId")
+#     sk = auth.get("access_key_secret") or auth.get("AccessKeySecret")
+#     token = auth.get("security_token") or auth.get("SecurityToken")
+#     endpoint = auth.get("endpoint") or auth.get("EndPoint") or ""
+#     bucket_name = auth.get("bucket") or bucket
+#     if not (ak and sk and endpoint):
+#         raise PanError("夸克上传凭证不完整（auth_info）")
+#     if not endpoint.startswith("http"):
+#         endpoint = "https://" + endpoint
+#     # endpoint 有时带 bucket 前缀，oss2 需要 bucket 无关的 endpoint
+#     prefix = f"https://{bucket_name}."
+#     if endpoint.startswith(prefix):
+#         endpoint = "https://" + endpoint[len(prefix):]
+#     prefix_http = f"http://{bucket_name}."
+#     if endpoint.startswith(prefix_http):
+#         endpoint = "http://" + endpoint[len(prefix_http):]
+#
+#     auth_obj = oss2.StsAuth(ak, sk, token) if token else oss2.Auth(ak, sk)
+#     b = oss2.Bucket(auth_obj, endpoint, bucket_name)
+#     # 大文件走分片上传，避免单次 PUT 的 5GB 限制
+#     oss2.resumable_upload(
+#         b,
+#         object_key,
+#         path,
+#         multipart_threshold=64 * 1024 * 1024,
+#         part_size=16 * 1024 * 1024,
+#         num_threads=4,
+#     )
+#
+#
+# async def upload_quark(path: str, name: str, folder: str) -> dict:
+#     cookie = (os.getenv("QUARK_COOKIE") or "").strip()
+#     if not cookie:
+#         return {"provider": "quark", "status": "skipped", "error": "未配置 QUARK_COOKIE"}
+#
+#     size = os.path.getsize(path)
+#     headers = {
+#         "Cookie": cookie,
+#         "User-Agent": DEFAULT_UA,
+#         "Origin": "https://pan.quark.cn",
+#         "Referer": "https://pan.quark.cn/",
+#         "Accept": "application/json, text/plain, */*",
+#         "Content-Type": "application/json",
+#     }
+#     async with httpx.AsyncClient(timeout=3600, headers=headers, follow_redirects=True) as client:
+#         pdir_fid = await _quark_ensure_folder(client, folder)
+#         pre = await _quark_request(
+#             client,
+#             "POST",
+#             "file/upload/pre",
+#             _quark_params(),
+#             {
+#                 "file_name": name,
+#                 "size": size,
+#                 "pdir_fid": pdir_fid,
+#                 "format_type": "application/octet-stream",
+#                 "checksum": "",
+#                 "dir": False,
+#             },
+#         )
+#         d = pre.get("data") or {}
+#         if d.get("finish") or d.get("return_type") == 2:
+#             log(f"[QUARK] 秒传命中: {name}")
+#             return {"provider": "quark", "status": "success", "error": None}
+#
+#         upload_id = d.get("upload_id")
+#         bucket = d.get("bucket")
+#         object_key = d.get("object_key")
+#         auth = d.get("auth_info")
+#         if isinstance(auth, str):
+#             try:
+#                 auth = json.loads(auth)
+#             except json.JSONDecodeError:
+#                 auth = {}
+#         if not (upload_id and bucket and object_key and auth):
+#             raise PanError(f"夸克预上传未返回完整参数: {json.dumps(d)[:300]}")
+#
+#         log(f"[QUARK] 直传 OSS: {name} ({size} bytes)")
+#         await asyncio.to_thread(_quark_put_oss, path, auth, bucket, object_key)
+#
+#         complete_body = {
+#             "upload_id": upload_id,
+#             "file_name": name,
+#             "pdir_fid": pdir_fid,
+#             "format_type": "application/octet-stream",
+#             "size": size,
+#             "dir": False,
+#         }
+#         try:
+#             await _quark_request(
+#                 client, "POST", "file/upload/complete", _quark_params(), complete_body
+#             )
+#         except PanError:
+#             # 部分账号需要先确认 auth 再 complete
+#             try:
+#                 await _quark_request(
+#                     client,
+#                     "POST",
+#                     "file/upload/auth",
+#                     _quark_params(),
+#                     {"upload_id": upload_id, "auth_info": auth},
+#                 )
+#             except PanError:
+#                 pass
+#             await _quark_request(
+#                 client, "POST", "file/upload/complete", _quark_params(), complete_body
+#             )
+#         log(f"[QUARK] 上传完成: {name}")
+#         return {"provider": "quark", "status": "success", "error": None}
+#
+#
+# # =============================================================
+# # 百度网盘（开放平台）
+# # =============================================================
+#
+# async def _baidu_request(
+#     client: httpx.AsyncClient,
+#     method: str,
+#     url: str,
+#     params: dict,
+#     data: dict,
+#     allow_errno: tuple[int, ...] = (),
+# ) -> dict:
+#     resp = await client.request(method, url, params=params, data=data)
+#     if resp.status_code >= 400:
+#         raise PanError(f"百度接口 HTTP {resp.status_code}: {resp.text[:200]}")
+#     payload = resp.json()
+#     errno = payload.get("errno", 0)
+#     if errno not in (0, *allow_errno):
+#         raise PanError(
+#             f"百度接口 errno={errno}: {payload.get('errmsg') or payload.get('request_id') or ''}"
+#         )
+#     return payload
+#
+#
+# async def upload_baidu(path: str, name: str, folder: str) -> dict:
+#     token = (os.getenv("BAIDU_ACCESS_TOKEN") or "").strip()
+#     if not token:
+#         return {"provider": "baidu", "status": "skipped", "error": "未配置 BAIDU_ACCESS_TOKEN"}
+#
+#     size = os.path.getsize(path)
+#     target = f"{folder}/{name}"
+#     headers = {"User-Agent": "pan.baidu.com"}
+#     async with httpx.AsyncClient(timeout=3600, headers=headers) as client:
+#         # 逐级创建目录（/images/Docker Hub/nginx）；-8 表示已存在
+#         current = ""
+#         for part in [p for p in folder.strip("/").split("/") if p]:
+#             current += f"/{part}"
+#             await _baidu_request(
+#                 client,
+#                 "POST",
+#                 BAIDU_API,
+#                 {"method": "create", "access_token": token},
+#                 {"path": current, "isdir": "1", "size": "0", "block_list": "[]"},
+#                 allow_errno=(-8,),
+#             )
+#
+#         block_list = md5_block_list(path)
+#         pre = await _baidu_request(
+#             client,
+#             "POST",
+#             BAIDU_API,
+#             {"method": "precreate", "access_token": token},
+#             {
+#                 "path": target,
+#                 "size": str(size),
+#                 "isdir": "0",
+#                 "autoinit": "1",
+#                 "block_list": json.dumps(block_list),
+#             },
+#         )
+#         if pre.get("return_type") == 2:
+#             log(f"[BAIDU] 秒传命中: {name}")
+#             return {"provider": "baidu", "status": "success", "error": None}
+#
+#         upload_id = pre.get("uploadid")
+#         if not upload_id:
+#             raise PanError(f"百度预上传未返回 uploadid: {pre}")
+#
+#         sem = asyncio.Semaphore(4)
+#
+#         async def upload_part(seq: int, chunk: bytes) -> None:
+#             async with sem:
+#                 resp = await client.post(
+#                     BAIDU_PCS,
+#                     params={
+#                         "method": "upload",
+#                         "access_token": token,
+#                         "type": "tmpfile",
+#                         "path": target,
+#                         "uploadid": upload_id,
+#                         "partseq": str(seq),
+#                     },
+#                     files={"file": ("part", chunk, "application/octet-stream")},
+#                 )
+#                 if resp.status_code >= 400:
+#                     raise PanError(f"百度分片 {seq} HTTP {resp.status_code}: {resp.text[:160]}")
+#                 payload = resp.json()
+#                 if payload.get("errno"):
+#                     raise PanError(f"百度分片 {seq} errno={payload.get('errno')}")
+#
+#         tasks: set[asyncio.Task] = set()
+#         with open(path, "rb") as f:
+#             seq = 0
+#             while True:
+#                 chunk = f.read(BLOCK_SIZE)
+#                 if not chunk:
+#                     break
+#                 tasks.add(asyncio.create_task(upload_part(seq, chunk)))
+#                 seq += 1
+#                 if len(tasks) >= 4:
+#                     done, tasks = await asyncio.wait(
+#                         tasks, return_when=asyncio.FIRST_COMPLETED
+#                     )
+#                     for task in done:
+#                         task.result()
+#         if tasks:
+#             await asyncio.gather(*tasks)
+#
+#         await _baidu_request(
+#             client,
+#             "POST",
+#             BAIDU_API,
+#             {"method": "create", "access_token": token},
+#             {
+#                 "path": target,
+#                 "size": str(size),
+#                 "isdir": "0",
+#                 "uploadid": upload_id,
+#                 "block_list": json.dumps(block_list),
+#             },
+#         )
+#         log(f"[BAIDU] 上传完成: {name}")
+#         return {"provider": "baidu", "status": "success", "error": None}
+#
+#
+# # =============================================================
+# # 阿里云盘
+# # =============================================================
+#
+# async def upload_aliyun(path: str, name: str, folder: str) -> dict:
+#     token = (os.getenv("ALIYUN_REFRESH_TOKEN") or "").strip()
+#     if not token:
+#         return {"provider": "aliyun", "status": "skipped", "error": "未配置 ALIYUN_REFRESH_TOKEN"}
+#
+#     def run() -> None:
+#         import logging
+#
+#         from aligo import Aligo
+#
+#         ali = Aligo(refresh_token=token, re_login=False, level=logging.WARNING)
+#         # 逐级创建 /images/{registry}/{image}
+#         parent = "root"
+#         target = None
+#         current_path = ""
+#         for part in [p for p in folder.strip("/").split("/") if p]:
+#             current_path = f"{current_path}/{part}".strip("/")
+#             target = ali.get_file_by_path(current_path)
+#             if target is None:
+#                 target = ali.create_folder(name=part, parent_file_id=parent)
+#             parent = target.file_id
+#         if target is None:
+#             raise PanError(f"阿里云盘目录创建失败: {folder}")
+#         ali.upload_file(path, parent_file_id=target.file_id, name=name)
+#
+#     await asyncio.to_thread(run)
+#     log(f"[ALIYUN] 上传完成: {name}")
+#     return {"provider": "aliyun", "status": "success", "error": None}
+#
+#
+# # =============================================================
+# # 迅雷云盘
+# # =============================================================
+#
+# async def upload_xunlei(path: str, name: str, folder: str) -> dict:
+#     token = (os.getenv("XUNLEI_REFRESH_TOKEN") or "").strip()
+#     if not token:
+#         return {"provider": "xunlei", "status": "skipped", "error": "未配置 XUNLEI_REFRESH_TOKEN"}
+#
+#     def run() -> None:
+#         from xunlei_upload import Xunlei, compute_gcid
+#
+#         xl = Xunlei()
+#         # 新布局必须按 /images/{registry}/{image} 逐级解析，不能使用固定 parent_id
+#         xl.parent_id = _resolve_xunlei_folder(xl, folder)
+#         size = os.path.getsize(path)
+#         gcid = compute_gcid(path, size)
+#         file_id, params = xl.create_upload(name, size, gcid)
+#         if params:
+#             xl.put_s3(path, params)
+#         log(f"[XUNLEI] 上传完成: {name} (file_id={file_id})")
+#
+#     await asyncio.to_thread(run)
+#     return {"provider": "xunlei", "status": "success", "error": None}
+#
+#
+# def _resolve_xunlei_folder(xl, folder: str) -> str:
+#     """按 /images/{registry}/{image} 路径逐级查找或创建迅雷目录，返回 folder id。"""
+#     parent_id = ""
+#     for part in [p for p in folder.strip("/").split("/") if p]:
+#         data = xl.request(
+#             "GET",
+#             "/files",
+#             "GET:/drive/v1/files",
+#             params={"parent_id": parent_id, "limit": 200, "with_audit": "true"},
+#         )
+#         files = data.get("files") or []
+#         hit = next(
+#             (
+#                 f
+#                 for f in files
+#                 if f.get("name") == part and f.get("kind") in ("drive#folder", "drive#dir")
+#             ),
+#             None,
+#         )
+#         if hit:
+#             parent_id = str(hit.get("id"))
+#             continue
+#         created = xl.request(
+#             "POST",
+#             "/files",
+#             "POST:/drive/v1/files",
+#             body={"kind": "drive#folder", "parent_id": parent_id, "name": part},
+#         )
+#         fid = (created.get("file") or {}).get("id") or created.get("id")
+#         if not fid:
+#             raise PanError(f"迅雷创建目录失败: {part}")
+#         parent_id = str(fid)
+#     return parent_id
+#
+#
+# # =============================================================
+# # 调度
+# # =============================================================
+#
+# UPLOADERS = {
+#     "quark": upload_quark,
+#     "baidu": upload_baidu,
+#     "aliyun": upload_aliyun,
+#     "xunlei": upload_xunlei,
+# }
+#
+#
+# async def run_one(
+#     provider: str, path: str, name: str, folder: str, timeout: int = 1800
+# ) -> dict:
+#     fn = UPLOADERS.get(provider)
+#     if not fn:
+#         return {"provider": provider, "status": "skipped", "error": "未知网盘"}
+#     try:
+#         return await asyncio.wait_for(fn(path, name, folder), timeout=timeout)
+#     except asyncio.TimeoutError:
+#         log(f"[{provider.upper()}] 上传超时（{timeout}s）")
+#         return {
+#             "provider": provider,
+#             "status": "failed",
+#             "error": f"上传超时（{timeout} 秒），请检查网盘网络或凭据",
+#         }
+#     except Exception as e:  # noqa: BLE001
+#         log(f"[{provider.upper()}] 失败: {e}")
+#         return {"provider": provider, "status": "failed", "error": str(e)[:500]}
+#
+#
+# async def main_async(args: argparse.Namespace) -> int:
+#     file_path = Path(args.file)
+#     if not file_path.is_file():
+#         log(f"文件不存在: {file_path}")
+#         return 2
+#     if file_path.stat().st_size <= 0:
+#         log("文件大小为 0，跳过")
+#         return 2
+#
+#     folder = normalize_dir(args.dir)
+#     providers = [
+#         p.strip().lower()
+#         for p in (args.providers or "").split(",")
+#         if p.strip()
+#     ]
+#     providers = [p for p in providers if p in UPLOADERS]
+#     if not providers:
+#         log("没有可执行的网盘 provider")
+#         return 2
+#
+#     callback_url = (args.callback_url or os.getenv("CALLBACK_URL") or "").strip()
+#     callback_secret = (args.callback_secret or os.getenv("CALLBACK_SECRET") or "").strip()
+#     task_id = (args.task_id or os.getenv("TASK_ID") or "").strip()
+#
+#     log(f"[PAN] 目标目录 {folder} | providers={providers} | file={args.name}")
+#     async with httpx.AsyncClient(timeout=30) as callback_client:
+#         async def notify_progress(result: dict) -> None:
+#             if not (callback_url and task_id):
+#                 return
+#             headers = {"Content-Type": "application/json"}
+#             if callback_secret:
+#                 headers["X-Callback-Secret"] = callback_secret
+#             try:
+#                 resp = await callback_client.post(
+#                     callback_url,
+#                     headers=headers,
+#                     json={
+#                         "taskId": task_id,
+#                         "status": "pan_result",
+#                         "panResult": result,
+#                     },
+#                 )
+#                 if resp.status_code >= 400:
+#                     log(f"[PAN] 进度回调 HTTP {resp.status_code}: {resp.text[:160]}")
+#             except Exception as e:  # noqa: BLE001
+#                 log(f"[PAN] 进度回调失败: {e}")
+#
+#         async def run_and_notify(provider: str) -> dict:
+#             result = await run_one(
+#                 provider, str(file_path), args.name, folder, timeout=args.timeout
+#             )
+#             await notify_progress(result)
+#             return result
+#
+#         results = await asyncio.gather(*(run_and_notify(p) for p in providers))
+#     ordered = [r for p in providers for r in results if r["provider"] == p]
+#
+#     if args.output:
+#         Path(args.output).write_text(
+#             json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8"
+#         )
+#     print(json.dumps(ordered, ensure_ascii=False), flush=True)
+#     return 0
+#
+#
+# def main() -> int:
+#     parser = argparse.ArgumentParser(description="上传文件到四大网盘固定目录（不出链）")
+#     parser.add_argument("--file", required=True)
+#     parser.add_argument("--name", required=True)
+#     parser.add_argument("--dir", default="/images")
+#     parser.add_argument("--providers", default="quark,baidu,aliyun,xunlei")
+#     parser.add_argument("--output", default="")
+#     parser.add_argument("--callback-url", default="")
+#     parser.add_argument("--callback-secret", default="")
+#     parser.add_argument("--task-id", default="")
+#     parser.add_argument("--timeout", type=int, default=1800)
+#     args = parser.parse_args()
+#     return asyncio.run(main_async(args))
+#
+#
+# if __name__ == "__main__":
+#     sys.exit(main())
+# __PAN_PY_END__
+
+# __XL_PY_START__
+# #!/usr/bin/env python3
+# # =============================================================
+# # xunlei_upload.py —— GitHub Actions 直传迅雷云盘并生成【永久】分享链接
+# #
+# # 用法：
+# #   python3 xunlei_upload.py <本地文件路径> [网盘文件名]
+# #   python3 xunlei_upload.py --refresh-share <file_id> [网盘文件名]
+# #
+# # 第二种模式用于「仅补链」：文件已在迅雷云盘，只按 file_id 重新生成分享链接，
+# # 不重新上传，供 R2 仍有效但迅雷链接失效时快速补齐。
+# #
+# # 必填环境变量：
+# #   XUNLEI_REFRESH_TOKEN   迅雷云盘 refresh_token（与网盘账号一致）
+# # 可选环境变量：
+# #   XUNLEI_CLIENT_ID       默认使用迅雷网页端 client_id
+# #   XUNLEI_DEVICE_ID       不填则按 refresh_token 派生稳定设备号
+# #   XUNLEI_PARENT_ID       上传目录 ID，默认空（根目录）
+# #
+# # 成功时 stdout 只输出一行 JSON：
+# #   {"share_url":"...","extract_code":"","remote_file_id":"...","remote_path":"/xxx.tar.gz"}
+# # 日志全部写 stderr，便于 Actions 里 `RESULT=$(...)` 取值。
+# #
+# # 说明：迅雷分享需要文件已经在云盘里。这里先创建可续传上传任务，
+# #       用接口返回的临时 S3 凭证直传，再按 file_id 建永久分享。
+# # =============================================================
+#
+# import hashlib
+# import json
+# import os
+# import sys
+# import time
+# from urllib.parse import urlsplit, urlunsplit
+#
+# import httpx
+#
+# AUTH_BASE = "https://xluser-ssl.xunlei.com"
+# API_BASE = "https://api-pan.xunlei.com/drive/v1"
+# DEFAULT_CLIENT_ID = "Xqp0kJBXWhwaTpB6"
+# UA = (
+#     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+#     "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+# )
+#
+#
+# def log(msg: str) -> None:
+#     print(msg, file=sys.stderr, flush=True)
+#
+#
+# class XunleiError(RuntimeError):
+#     pass
+#
+#
+# class Xunlei:
+#     def __init__(self) -> None:
+#         self.refresh_token = (os.getenv("XUNLEI_REFRESH_TOKEN") or "").strip()
+#         if not self.refresh_token:
+#             raise XunleiError("缺少环境变量 XUNLEI_REFRESH_TOKEN")
+#         self.client_id = (os.getenv("XUNLEI_CLIENT_ID") or DEFAULT_CLIENT_ID).strip()
+#         self.device_id = (os.getenv("XUNLEI_DEVICE_ID") or "").strip() or hashlib.md5(
+#             f"{self.refresh_token}xlrefresh".encode()
+#         ).hexdigest()
+#         self.parent_id = (os.getenv("XUNLEI_PARENT_ID") or "").strip()
+#         self._access_token = ""
+#         self._access_exp = 0.0
+#         self._captcha: dict[str, tuple[str, float]] = {}
+#         self.client = httpx.Client(timeout=60, follow_redirects=True)
+#
+#     # ---------- 鉴权 ----------
+#     def access_token(self) -> str:
+#         if self._access_token and self._access_exp > time.time():
+#             return self._access_token
+#         resp = self.client.post(
+#             f"{AUTH_BASE}/v1/auth/token",
+#             json={
+#                 "client_id": self.client_id,
+#                 "grant_type": "refresh_token",
+#                 "refresh_token": self.refresh_token,
+#             },
+#         )
+#         data = resp.json() if resp.status_code < 400 else {}
+#         info = data.get("data") or {}
+#         token = info.get("access_token")
+#         if not token:
+#             raise XunleiError(f"refresh_token 换取 access_token 失败: {data.get('error') or data}")
+#         self._access_token = token
+#         self._access_exp = time.time() + max(60, int(info.get("expires_in", 3600)) - 60)
+#         return token
+#
+#     def captcha_token(self, action: str) -> str:
+#         cached = self._captcha.get(action)
+#         if cached and cached[1] > time.time():
+#             return cached[0]
+#         resp = self.client.post(
+#             f"{AUTH_BASE}/v1/shield/captcha/init",
+#             json={
+#                 "client_id": self.client_id,
+#                 "action": action,
+#                 "device_id": self.device_id,
+#                 "meta": {
+#                     "username": "",
+#                     "phone_number": "",
+#                     "email": "",
+#                     "package_name": "pan.xunlei.com",
+#                     "client_version": "1.45.0",
+#                     "captcha_sign": "1.fe2108ad808a74c9ac0243309242726c",
+#                     "timestamp": "1645241033384",
+#                     "user_id": "0",
+#                 },
+#             },
+#         )
+#         data = resp.json() if resp.status_code < 400 else {}
+#         info = data.get("data") or {}
+#         token = info.get("captcha_token")
+#         if not token:
+#             raise XunleiError(f"领取 captcha_token 失败: {data.get('error') or data}")
+#         self._captcha[action] = (token, time.time() + max(60, int(info.get("expires_in", 300)) - 10))
+#         return token
+#
+#     def request(
+#         self,
+#         method: str,
+#         path: str,
+#         action: str,
+#         params: dict | None = None,
+#         body: dict | None = None,
+#     ) -> dict:
+#         headers = {
+#             "Accept": "application/json, text/plain, */*",
+#             "Content-Type": "application/json",
+#             "User-Agent": UA,
+#             "Origin": "https://pan.xunlei.com",
+#             "Referer": "https://pan.xunlei.com/",
+#             "x-client-id": self.client_id,
+#             "x-device-id": self.device_id,
+#             "Authorization": f"Bearer {self.access_token()}",
+#             "x-captcha-token": self.captcha_token(action),
+#         }
+#         resp = self.client.request(
+#             method, f"{API_BASE}{path}", params=params, json=body, headers=headers
+#         )
+#         if resp.status_code >= 400:
+#             raise XunleiError(f"迅雷接口 HTTP {resp.status_code}: {resp.text[:300]}")
+#         data = resp.json()
+#         if data.get("error_code"):
+#             raise XunleiError(
+#                 f"迅雷接口错误 {data.get('error_code')}: "
+#                 f"{data.get('error_description') or data.get('error') or ''}"
+#             )
+#         return data
+#
+#     # ---------- 上传 ----------
+#     def create_upload(self, name: str, size: int, gcid: str) -> tuple[str, dict]:
+#         data = self.request(
+#             "POST",
+#             "/files",
+#             "POST:/drive/v1/files",
+#             body={
+#                 "kind": "drive#file",
+#                 "parent_id": self.parent_id,
+#                 "name": name,
+#                 "size": size,
+#                 "hash": gcid,
+#                 "upload_type": "UPLOAD_TYPE_RESUMABLE",
+#                 "space": "",
+#             },
+#         )
+#         file_id = (data.get("file") or {}).get("id") or data.get("id")
+#         params = ((data.get("resumable") or {}).get("params")) or {}
+#         if not file_id:
+#             raise XunleiError(f"创建上传任务未返回 fileId: {json.dumps(data)[:300]}")
+#         if not params.get("endpoint") or not params.get("key"):
+#             # 命中秒传 / 云端已存在同 hash 文件时不会返回可续传参数，直接去出链
+#             log("[XL] 未返回可续传参数，按秒传处理，跳过上传")
+#             return str(file_id), {}
+#         return str(file_id), params
+#
+#     def put_s3(self, file_path: str, params: dict) -> None:
+#         try:
+#             import boto3
+#             from boto3.s3.transfer import TransferConfig
+#             from botocore.config import Config
+#         except ImportError as e:  # pragma: no cover
+#             raise XunleiError("缺少 boto3，请在 workflow 中 pip install boto3") from e
+#
+#         bucket = params["bucket"]
+#         key = params["key"]
+#         endpoint = normalize_endpoint(params["endpoint"], bucket)
+#         log(f"[S3] endpoint={endpoint} bucket={bucket} key={key}")
+#
+#         last_err: Exception | None = None
+#         for style in ("virtual", "path"):
+#             client = boto3.client(
+#                 "s3",
+#                 endpoint_url=endpoint,
+#                 aws_access_key_id=params["access_key_id"],
+#                 aws_secret_access_key=params["access_key_secret"],
+#                 aws_session_token=params.get("security_token") or None,
+#                 region_name="xunlei",
+#                 config=Config(
+#                     signature_version="s3v4",
+#                     s3={"addressing_style": style},
+#                     retries={"max_attempts": 5, "mode": "standard"},
+#                     connect_timeout=30,
+#                     read_timeout=300,
+#                 ),
+#             )
+#             try:
+#                 log(f"[S3] 开始上传（{style} addressing）…")
+#                 client.upload_file(
+#                     file_path,
+#                     bucket,
+#                     key,
+#                     Config=TransferConfig(
+#                         multipart_threshold=16 * 1024 * 1024,
+#                         multipart_chunksize=16 * 1024 * 1024,
+#                         max_concurrency=4,
+#                     ),
+#                 )
+#                 log("[S3] 上传完成")
+#                 return
+#             except Exception as e:  # noqa: BLE001
+#                 last_err = e
+#                 log(f"[S3] {style} 方式失败: {e}")
+#         raise XunleiError(f"S3 上传失败: {last_err}")
+#
+#     def create_share(self, file_id: str, title: str) -> dict:
+#         last_err: Exception | None = None
+#         for attempt in range(1, 7):
+#             try:
+#                 return self.request(
+#                     "POST",
+#                     "/share",
+#                     "POST:/drive/v1/share",
+#                     body={
+#                         "file_ids": [file_id],
+#                         "share_to": "copy",
+#                         "params": {"subscribe_push": "false", "WithPassCodeInLink": "true"},
+#                         "title": title,
+#                         "restore_limit": "-1",
+#                         # 0 = 永久分享
+#                         "expiration_days": "0",
+#                     },
+#                 )
+#             except Exception as e:  # noqa: BLE001
+#                 last_err = e
+#                 log(f"[SHARE] 第 {attempt}/6 次失败: {e}")
+#                 time.sleep(5)
+#         raise XunleiError(f"创建分享失败: {last_err}")
+#
+#
+# def normalize_endpoint(raw: str, bucket: str) -> str:
+#     """把迅雷返回的 endpoint 规范成 boto3 可用的 bucket 无关 endpoint。"""
+#     ep = (raw or "").strip()
+#     if not ep:
+#         raise XunleiError("上传参数缺少 endpoint")
+#     if not ep.startswith("http"):
+#         ep = "https://" + ep
+#     parts = urlsplit(ep)
+#     host = parts.netloc
+#     if host.startswith(f"{bucket}."):
+#         host = host[len(bucket) + 1 :]
+#     return urlunsplit((parts.scheme, host, parts.path.rstrip("/"), "", ""))
+#
+#
+# def compute_gcid(path: str, size: int) -> str:
+#     """迅雷 GCID：按块 SHA1 后再整体 SHA1。"""
+#     psize = 0x40000
+#     while size / psize > 0x200 and psize < 0x200000:
+#         psize <<= 1
+#     outer = hashlib.sha1()
+#     with open(path, "rb") as f:
+#         while True:
+#             block = f.read(psize)
+#             if not block:
+#                 break
+#             outer.update(hashlib.sha1(block).digest())
+#     return outer.hexdigest()
+#
+#
+# def refresh_share(file_id: str, name: str) -> int:
+#     """仅按已有 file_id 重新生成分享链接（轻量补链）。"""
+#     try:
+#         log(f"[XL] 补链: file_id={file_id} name={name}")
+#         xl = Xunlei()
+#         share = xl.create_share(file_id, name)
+#         share_url = share.get("share_url") or ""
+#         if not share_url:
+#             raise XunleiError(f"创建分享未返回 share_url: {json.dumps(share)[:300]}")
+#         result = {
+#             "share_url": share_url,
+#             "extract_code": share.get("pass_code") or "",
+#             "remote_file_id": file_id,
+#             "remote_path": f"/{name}",
+#         }
+#         print(json.dumps(result, ensure_ascii=False), flush=True)
+#         return 0
+#     except Exception as e:  # noqa: BLE001
+#         log(f"[XL] 补链失败: {e}")
+#         return 1
+#
+#
+# def main() -> int:
+#     if len(sys.argv) >= 3 and sys.argv[1] == "--refresh-share":
+#         file_id = sys.argv[2].strip()
+#         if not file_id:
+#             log("缺少迅雷文件 ID")
+#             return 2
+#         name = (sys.argv[3] if len(sys.argv) > 3 else f"{file_id}.tar.gz").strip()
+#         return refresh_share(file_id, name)
+#
+#     if len(sys.argv) < 2:
+#         log("用法: xunlei_upload.py <本地文件路径> [网盘文件名]")
+#         log("      xunlei_upload.py --refresh-share <file_id> [网盘文件名]")
+#         return 2
+#     file_path = sys.argv[1]
+#     if not os.path.isfile(file_path):
+#         log(f"文件不存在: {file_path}")
+#         return 2
+#     name = (sys.argv[2] if len(sys.argv) > 2 else os.path.basename(file_path)).strip()
+#     size = os.path.getsize(file_path)
+#     if size <= 0:
+#         log("文件大小为 0，跳过")
+#         return 2
+#
+#     try:
+#         log(f"[XL] 文件: {name} ({size} bytes)")
+#         log("[XL] 计算 GCID …")
+#         gcid = compute_gcid(file_path, size)
+#         log(f"[XL] GCID={gcid}")
+#
+#         xl = Xunlei()
+#         file_id, params = xl.create_upload(name, size, gcid)
+#         log(f"[XL] 已创建上传任务 fileId={file_id}")
+#
+#         if params:
+#             xl.put_s3(file_path, params)
+#
+#         # 上传落库可能有延迟，先等一下再建分享
+#         time.sleep(3)
+#         share = xl.create_share(file_id, name)
+#         share_url = share.get("share_url") or ""
+#         if not share_url:
+#             raise XunleiError(f"创建分享未返回 share_url: {json.dumps(share)[:300]}")
+#
+#         result = {
+#             "share_url": share_url,
+#             "extract_code": share.get("pass_code") or "",
+#             "remote_file_id": file_id,
+#             "remote_path": f"/{name}",
+#         }
+#         print(json.dumps(result, ensure_ascii=False), flush=True)
+#         return 0
+#     except Exception as e:  # noqa: BLE001
+#         log(f"[XL] 失败: {e}")
+#         return 1
+#
+#
+# if __name__ == "__main__":
+#     sys.exit(main())
+# __XL_PY_END__
