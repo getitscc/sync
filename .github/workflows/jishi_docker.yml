@@ -508,10 +508,26 @@ jobs:
           python3 -m venv /tmp/pan-venv
           /tmp/pan-venv/bin/pip install --quiet --disable-pip-version-check httpx oss2 boto3 aligo
 
-          # 从本 workflow 的注释块解出内嵌脚本，无需额外脚本目录
+          # 从当前正在运行的 workflow 文件解出内嵌脚本（文件名可能是 jishi_docker.yml 等）
           mkdir -p /tmp/jishi-pans
-          WORKFLOW_FILE="$GITHUB_WORKSPACE/.github/workflows/docker-sync.yml"
-          [ -f "$WORKFLOW_FILE" ] || { echo "::error::找不到 workflow 文件：$WORKFLOW_FILE"; exit 1; }
+          WORKFLOW_FILE=""
+          if [ -n "${GITHUB_WORKFLOW_REF:-}" ]; then
+            WORKFLOW_REF_PATH="${GITHUB_WORKFLOW_REF%%@*}"                 # owner/repo/.github/workflows/xxx.yml
+            WORKFLOW_REL_PATH="${WORKFLOW_REF_PATH#"$GITHUB_REPOSITORY"/}" # .github/workflows/xxx.yml
+            if [ -f "$GITHUB_WORKSPACE/$WORKFLOW_REL_PATH" ]; then
+              WORKFLOW_FILE="$GITHUB_WORKSPACE/$WORKFLOW_REL_PATH"
+            fi
+          fi
+          if [ -z "$WORKFLOW_FILE" ]; then
+            for cand in .github/workflows/jishi_docker.yml .github/workflows/docker-sync.yml; do
+              if [ -f "$GITHUB_WORKSPACE/$cand" ]; then
+                WORKFLOW_FILE="$GITHUB_WORKSPACE/$cand"
+                break
+              fi
+            done
+          fi
+          [ -n "$WORKFLOW_FILE" ] || { echo "::error::找不到当前正在运行的 workflow 文件"; exit 1; }
+          echo "workflow 文件：$WORKFLOW_FILE"
 
           echo "workflow 行数：$(wc -l < "$WORKFLOW_FILE")"
           grep -n "__PAN_PY_START__\|__PAN_PY_END__\|__XL_PY_START__\|__XL_PY_END__" "$WORKFLOW_FILE" \
@@ -527,13 +543,13 @@ jobs:
             | sed -E 's/^[[:space:]]*#[[:space:]]?//' > /tmp/jishi-pans/xunlei_upload.py
 
           [ -s /tmp/jishi-pans/pan_upload.py ] || {
-            echo "::error::内嵌 pan_upload.py 解包为空：当前分支的 docker-sync.yml 缺少文件末尾的 __PAN_PY_START__/__PAN_PY_END__ 注释块"
-            echo "::error::请从本地完整复制 .github/workflows/docker-sync.yml（约 1590 行）后重新推送"
+            echo "::error::内嵌 pan_upload.py 解包为空：当前 workflow 文件缺少末尾的 __PAN_PY_START__/__PAN_PY_END__ 注释块"
+            echo "::error::请把本地完整 workflow（约 1600 行）覆盖到 $WORKFLOW_FILE 对应的仓库文件"
             exit 1
           }
           [ -s /tmp/jishi-pans/xunlei_upload.py ] || {
-            echo "::error::内嵌 xunlei_upload.py 解包为空：当前分支的 docker-sync.yml 缺少文件末尾的 __XL_PY_START__/__XL_PY_END__ 注释块"
-            echo "::error::请从本地完整复制 .github/workflows/docker-sync.yml（约 1590 行）后重新推送"
+            echo "::error::内嵌 xunlei_upload.py 解包为空：当前 workflow 文件缺少末尾的 __XL_PY_START__/__XL_PY_END__ 注释块"
+            echo "::error::请把本地完整 workflow（约 1600 行）覆盖到 $WORKFLOW_FILE 对应的仓库文件"
             exit 1
           }
           echo "内嵌脚本：pan=$(wc -l < /tmp/jishi-pans/pan_upload.py) 行，xunlei=$(wc -l < /tmp/jishi-pans/xunlei_upload.py) 行"
