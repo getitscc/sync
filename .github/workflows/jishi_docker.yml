@@ -1,20 +1,15 @@
 name: Docker Sync (R2 + 四网盘静默归档)
 
 # =====================================================
-# 数据面：拉取 → 打包 → R2 临时直链 → 四网盘 /images/ 层级目录静默上传
-# 控制面：网盘目录分享链接由国内服务器/管理员通过 Worker API 维护
+# 数据面：拉取 → 打包 → 上传 R2 → 回传直链
 #
-# 本工作流不生成任何网盘分享链接，只回传每个文件在每个网盘的上传结果。
+# 网盘归档功能已下线，本工作流只负责 R2。
 #
 # 需要 Secrets：
-#   R2_*                  Cloudflare R2 上传
+#   R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
+#   R2_BUCKET（可选，默认 jishi）
+#   R2_PREFIX（可选，默认 docker）
 #   CALLBACK_SECRET       与 Worker 的 WEBHOOK_SECRET 一致
-#   QUARK_COOKIE          夸克网盘 Cookie
-#   BAIDU_ACCESS_TOKEN    百度网盘开放平台 access_token
-#   ALIYUN_REFRESH_TOKEN  阿里云盘 refresh_token
-#   XUNLEI_REFRESH_TOKEN  迅雷云盘 refresh_token
-#   XUNLEI_CLIENT_ID      可选：迅雷网页端 client_id
-#   XUNLEI_DEVICE_ID      可选：不填会按 refresh_token 派生稳定设备号
 # =====================================================
 
 on:
@@ -38,20 +33,8 @@ on:
         description: '是否上传 R2（true/false）'
         required: false
         default: 'true'
-      pan_providers:
-        description: '目标网盘（逗号分隔：quark,baidu,aliyun,xunlei）'
-        required: false
-        default: 'quark,baidu,aliyun,xunlei'
-      folder_path:
-        description: '网盘分享根目录（默认 /images）'
-        required: false
-        default: '/images'
-      pan_dir:
-        description: '可选：覆盖实际上传目录（默认 /images/{registry}/{image}）'
-        required: false
-        default: ''
       pan_file_name:
-        description: '可选：覆盖网盘文件名（默认 {image}_{version}_linux-{arch}.tar.gz）'
+        description: '可选：覆盖镜像文件名（默认 {image}_{version}_linux-{arch}.tar.gz）'
         required: false
         default: ''
       task_id:
@@ -74,12 +57,6 @@ jobs:
     timeout-minutes: 180
     steps:
       # ============================================================
-      # 步骤 0：检出仓库（网盘上传脚本位于 .github/scripts/）
-      # ============================================================
-      - name: 0. 检出仓库
-        uses: actions/checkout@v4
-
-      # ============================================================
       # 步骤 1：参数解析
       # ============================================================
       - name: 1. 参数解析与镜像引用拼装
@@ -91,9 +68,6 @@ jobs:
           IN_VERSION: ${{ github.event.client_payload.version || github.event.inputs.version }}
           IN_ARCH: ${{ github.event.client_payload.arch || github.event.inputs.arch || 'linux/amd64' }}
           IN_R2_ENABLED: ${{ github.event.client_payload.r2_enabled || github.event.inputs.r2_enabled || 'true' }}
-          IN_PAN_PROVIDERS: ${{ github.event.client_payload.pan_providers || github.event.inputs.pan_providers || 'quark,baidu,aliyun,xunlei' }}
-          IN_FOLDER_PATH: ${{ github.event.client_payload.folder_path || github.event.inputs.folder_path || '/images' }}
-          IN_PAN_DIR: ${{ github.event.client_payload.pan_dir || github.event.inputs.pan_dir }}
           IN_PAN_FILE_NAME: ${{ github.event.client_payload.pan_file_name || github.event.inputs.pan_file_name }}
           IN_TASK: ${{ github.event.client_payload.task_id || github.event.inputs.task_id }}
           IN_CALLBACK: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
@@ -129,7 +103,7 @@ jobs:
           ARCH_NAME="${ARCH_REST%%/*}"; ARCH_VARIANT=""
           [[ "$ARCH_REST" == */* ]] && ARCH_VARIANT="${ARCH_REST#*/}"
 
-          # registry → 网盘顶层 label；第三层镜像目录名
+          # registry → 镜像目录名
           REGISTRY="docker.io"; REPO_PATH="$FULL_REPO"
           if [[ "$FULL_REPO" == */* ]]; then
             FIRST="${FULL_REPO%%/*}"
@@ -158,11 +132,6 @@ jobs:
           fi
           IMAGE_DIR="${IMAGE_DIR// /-}"
 
-          PAN_DIR="${IN_PAN_DIR:-/images/${REGISTRY_LABEL}/${IMAGE_DIR}}"
-          case "$PAN_DIR" in
-            /*) ;;
-            *) PAN_DIR="/$PAN_DIR" ;;
-          esac
           PAN_FILE_NAME="${IN_PAN_FILE_NAME:-${IMAGE_DIR}_${VERSION}_${ARCH_OS}-${ARCH_NAME}${ARCH_VARIANT:+-${ARCH_VARIANT}}.tar.gz}"
           TAR_NAME="${PAN_FILE_NAME%.gz}"
           CATEGORY_DIR="${IMAGE_DIR}"
@@ -171,17 +140,6 @@ jobs:
           [ "$R2_ENABLED" = "true" ] || R2_ENABLED="false"
           DO_R2="true"
           [ "$R2_ENABLED" = "true" ] || DO_R2="false"
-
-          PAN_PROVIDERS_LIST="$(printf '%s' "${IN_PAN_PROVIDERS:-}" | tr -d '\r' | xargs || true)"
-          FOLDER_PATH="$(printf '%s' "${IN_FOLDER_PATH:-/images}" | tr -d '\r' | xargs || true)"
-          FOLDER_PATH="${FOLDER_PATH:-/images}"
-          case "$FOLDER_PATH" in
-            /*) ;;
-            *) FOLDER_PATH="/$FOLDER_PATH" ;;
-          esac
-
-          DO_PANS="true"
-          [ -n "$PAN_PROVIDERS_LIST" ] || DO_PANS="false"
 
           TASK_ID="${IN_TASK:-manual_$(date +%s)}"
           CALLBACK_URL="$IN_CALLBACK"
@@ -200,26 +158,19 @@ jobs:
             echo "CATEGORY_DIR=$CATEGORY_DIR"
             echo "REGISTRY_LABEL=$REGISTRY_LABEL"
             echo "IMAGE_DIR=$IMAGE_DIR"
-            echo "PAN_DIR=$PAN_DIR"
             echo "TAR_NAME=$TAR_NAME"
             echo "PAN_FILE_NAME=$PAN_FILE_NAME"
             echo "R2_ENABLED=$R2_ENABLED"
             echo "DO_R2=$DO_R2"
-            echo "DO_PANS=$DO_PANS"
-            echo "PAN_PROVIDERS_LIST=$PAN_PROVIDERS_LIST"
-            echo "FOLDER_PATH=$FOLDER_PATH"
             echo "TASK_ID=$TASK_ID"
             echo "CALLBACK_URL=$CALLBACK_URL"
           } >> "$GITHUB_ENV"
 
           {
             echo "do_r2=$DO_R2"
-            echo "do_pans=$DO_PANS"
-            echo "pan_providers=$PAN_PROVIDERS_LIST"
-            echo "folder_path=$FOLDER_PATH"
           } >> "$GITHUB_OUTPUT"
 
-          echo "📋 $FULL_IMAGE | $ARCH | providers=$PAN_PROVIDERS_LIST | dir=$PAN_DIR"
+          echo "📋 $FULL_IMAGE | $ARCH | R2 only"
 
           if [ -n "$CALLBACK_URL" ]; then
             CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$CALLBACK_URL" \
@@ -482,115 +433,9 @@ jobs:
           exit 1
 
       # ============================================================
-      # 步骤 7：四网盘静默上传（只上传，不出链）
+      # 步骤 7：失败回传（兜底）
       # ============================================================
-      - name: 7. 静默上传到四大网盘固定目录
-        id: pans
-        if: always() && steps.params.outputs.do_pans == 'true'
-        env:
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
-          QUARK_COOKIE: ${{ secrets.QUARK_COOKIE }}
-          BAIDU_ACCESS_TOKEN: ${{ secrets.BAIDU_ACCESS_TOKEN }}
-          ALIYUN_REFRESH_TOKEN: ${{ secrets.ALIYUN_REFRESH_TOKEN }}
-          XUNLEI_REFRESH_TOKEN: ${{ secrets.XUNLEI_REFRESH_TOKEN }}
-          XUNLEI_CLIENT_ID: ${{ secrets.XUNLEI_CLIENT_ID }}
-          XUNLEI_DEVICE_ID: ${{ secrets.XUNLEI_DEVICE_ID }}
-        run: |
-          set -euo pipefail
-          if [ -n "$CALLBACK_URL" ]; then
-            CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$CALLBACK_URL" \
-              -H "Content-Type: application/json" \
-              -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "$(jq -n --arg t "$TASK_ID" '{taskId:$t,stage:"uploading_pans",stage_msg:"R2 已就绪，正在静默归档到网盘目录…"}')" || echo "000")
-            echo "回调 uploading_pans: HTTP $CODE"
-            [ "$CODE" = "200" ] || echo "::warning::阶段回调失败（HTTP $CODE）"
-          fi
-
-          python3 -m venv /tmp/pan-venv
-          /tmp/pan-venv/bin/pip install --quiet --disable-pip-version-check httpx boto3 aligo
-
-          SCRIPTS="$GITHUB_WORKSPACE/.github/scripts"
-          [ -d "$SCRIPTS" ] || { echo "::error::缺少 .github/scripts 目录"; exit 1; }
-          echo "脚本目录：$SCRIPTS"
-
-          PAN_TIMEOUT=1800
-          RUN=()
-          for p in $(printf '%s' "$PAN_PROVIDERS_LIST" | tr ',' ' '); do
-            case "$p" in
-              quark|baidu|aliyun|xunlei) RUN+=("$p") ;;
-              *) echo "跳过未知网盘：$p" ;;
-            esac
-          done
-          [ "${#RUN[@]}" -gt 0 ] || { echo "没有可执行的网盘"; exit 0; }
-
-          # 每个网盘一个独立脚本，并行执行；各自写结果文件并实时回调进度
-          for p in "${RUN[@]}"; do
-            [ -f "$SCRIPTS/${p}_upload.py" ] || { echo "::error::缺少脚本 ${p}_upload.py"; exit 1; }
-            (
-              timeout "$((PAN_TIMEOUT + 60))" /tmp/pan-venv/bin/python "$SCRIPTS/${p}_upload.py" \
-                --file "$LOCAL_FILE" \
-                --name "$PAN_FILE_NAME" \
-                --dir "$PAN_DIR" \
-                --version "$VERSION" \
-                --output "/tmp/pan-results-${p}.json" \
-                --callback-url "$CALLBACK_URL" \
-                --callback-secret "$CALLBACK_SECRET" \
-                --task-id "$TASK_ID" \
-                --timeout "$PAN_TIMEOUT"
-            ) &
-          done
-          wait || true
-
-          for p in "${RUN[@]}"; do
-            if [ ! -s "/tmp/pan-results-${p}.json" ]; then
-              printf '{"provider":"%s","status":"failed","error":"上传超时或被中断"}\n' "$p" \
-                > "/tmp/pan-results-${p}.json"
-            fi
-          done
-          jq -s '.' /tmp/pan-results-*.json > /tmp/pan-results.json
-          echo "归档结果：$(cat /tmp/pan-results.json)"
-
-      # ============================================================
-      # 步骤 8：回传每文件每网盘归档结果
-      # ============================================================
-      - name: 8. 回调归档结果
-        if: always() && steps.params.outputs.do_pans == 'true'
-        env:
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
-        run: |
-          set -euo pipefail
-          RESULTS='[]'
-          if [ -f /tmp/pan-results.json ] && jq -e . /tmp/pan-results.json >/dev/null 2>&1; then
-            RESULTS=$(cat /tmp/pan-results.json)
-          fi
-          [ -n "${CALLBACK_URL:-}" ] || { echo "⚠️ 未配置 callback_url，跳过归档回调"; exit 0; }
-
-          PAYLOAD=$(jq -n --arg taskId "$TASK_ID" --argjson results "$RESULTS" '{
-            taskId: $taskId,
-            status: "archive_done",
-            panResults: $results
-          }')
-
-          for i in 1 2 3; do
-            RESP=$(curl -sS -w "\n%{http_code}" -X POST "$CALLBACK_URL" \
-              -H "Content-Type: application/json" \
-              -H "X-Callback-Secret: $CALLBACK_SECRET" \
-              -d "$PAYLOAD" || true)
-            CODE=$(printf '%s' "$RESP" | tail -n1)
-            BODY=$(printf '%s' "$RESP" | sed '$d')
-            echo "回调 archive_done: HTTP $CODE"
-            [ -n "$BODY" ] && echo "响应: $BODY"
-            [ "$CODE" = "200" ] && { echo "ARCHIVE_SENT=1" >> "$GITHUB_ENV"; exit 0; }
-            echo "⚠️  回调失败（HTTP $CODE），重试 $i/3"
-            sleep 5
-          done
-          echo "::error::归档结果回调 3 次均失败"
-          exit 1
-
-      # ============================================================
-      # 步骤 9：失败回传（兜底）
-      # ============================================================
-      - name: 9. 失败回传（兜底）
+      - name: 7. 失败回传（兜底）
         if: failure()
         shell: bash
         env:
@@ -620,14 +465,14 @@ jobs:
           if [ -f /tmp/pan-results.json ] && jq -e . /tmp/pan-results.json >/dev/null 2>&1; then
             RESULTS=$(cat /tmp/pan-results.json)
           fi
-          HINT="${FAIL_HINT:-后台任务失败：拉取/压缩/R2/网盘归档链路中断，请查看 Actions 日志}"
+          HINT="${FAIL_HINT:-后台任务失败：拉取/压缩/上传 R2 链路中断，请查看 Actions 日志}"
           CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" -H "X-Callback-Secret: $CALLBACK_SECRET" \
             -d "$(jq -n --arg t "${TASK_ID:-manual}" --arg e "$HINT" --argjson results "$RESULTS" '{taskId:$t,status:"failed",error:$e,panResults:$results}')" || echo "000")
           echo "回调 failed: HTTP $CODE"
           [ "$CODE" = "200" ] || echo "::warning::失败回调未送达（HTTP $CODE）"
 
-      - name: 10. 清理 Runner 临时文件
+      - name: 8. 清理 Runner 临时文件
         if: always()
         shell: bash
         run: |
