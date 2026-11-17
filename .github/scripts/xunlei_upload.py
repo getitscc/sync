@@ -354,6 +354,10 @@ def _load_remote_token(args) -> str:
         if resp.status_code == 200:
             data = resp.json()
             return str((data.get("data") or {}).get("value") or "").strip()
+        if resp.status_code == 401:
+            print("::warning::迅雷 token 存储鉴权失败，请检查 WEBHOOK_SECRET 是否一致", flush=True)
+        elif resp.status_code == 404 and '"error":"not_found"' in resp.text:
+            print("::warning::Worker 尚未部署 /api/internal/token 接口，轮换 token 无法持久化", flush=True)
     except Exception as e:  # noqa: BLE001
         log(f"[XUNLEI] 读取轮换 token 失败: {e}")
     return ""
@@ -372,8 +376,14 @@ def _save_remote_token(args, value: str) -> None:
         )
         if resp.status_code != 200:
             log(f"[XUNLEI] 警告：refresh_token 回写失败 HTTP {resp.status_code}")
+            print(
+                f"::warning::迅雷 refresh_token 回写失败 HTTP {resp.status_code}，"
+                "下次运行可能鉴权失败；请确认 Worker 已部署并已设置 R2_TTL_DAYS 同版本代码",
+                flush=True,
+            )
     except Exception as e:  # noqa: BLE001
         log(f"[XUNLEI] 警告：refresh_token 回写失败: {e}")
+        print("::warning::迅雷 refresh_token 回写异常，下次运行可能鉴权失败", flush=True)
 
 
 async def upload_xunlei(args) -> None:
