@@ -69,13 +69,30 @@ class Xunlei:
         self._access_token = ""
         self._access_exp = 0.0
         self._captcha: dict[str, tuple[str, float]] = {}
-        self.client = httpx.Client(timeout=60, follow_redirects=True)
+        self.client = httpx.Client(
+            timeout=httpx.Timeout(connect=60.0, read=300.0, write=300.0, pool=30.0),
+            follow_redirects=True,
+        )
+
+    def _request_retry(self, method: str, url: str, **kwargs):
+        """对 TLS 握手超时等瞬时网络错误做 3 次退避重试。"""
+        last: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                return self.client.request(method, url, **kwargs)
+            except Exception as e:  # noqa: BLE001
+                last = e
+                log(f"[XUNLEI] 网络请求 {attempt}/3 失败: {e}")
+                if attempt < 3:
+                    time.sleep(3 * attempt)
+        raise XunleiError(f"迅雷网络请求失败: {last}")
 
     # ---------- 鉴权 ----------
     def access_token(self) -> str:
         if self._access_token and self._access_exp > time.time():
             return self._access_token
-        resp = self.client.post(
+        resp = self._request_retry(
+            "POST",
             f"{AUTH_BASE}/v1/auth/token",
             json={
                 "client_id": self.client_id,
@@ -112,7 +129,8 @@ class Xunlei:
         cached = self._captcha.get(action)
         if cached and cached[1] > time.time():
             return cached[0]
-        resp = self.client.post(
+        resp = self._request_retry(
+            "POST",
             f"{AUTH_BASE}/v1/shield/captcha/init",
             json={
                 "client_id": self.client_id,
@@ -157,7 +175,7 @@ class Xunlei:
             "Authorization": f"Bearer {self.access_token()}",
             "x-captcha-token": self.captcha_token(action),
         }
-        resp = self.client.request(
+        resp = self._request_retry(
             method, f"{API_BASE}{path}", params=params, json=body, headers=headers
         )
         if resp.status_code >= 400:
@@ -411,16 +429,24 @@ async def upload_xunlei(args) -> None:
                 last_error = e
         if xl is None:
             raise last_error or XunleiError("迅雷鉴权失败")
+        log("[XUNLEI] 鉴权成功")
 
         # 首次跑通也把当前 token 存一份，后续不再依赖 GitHub Secret 是否过期
         _save_remote_token(args, xl.refresh_token)
         # 新布局必须逐级解析 /images/{registry}/{image}，不能使用固定 parent_id
+        log(f"[XUNLEI] 解析目录: {args.dir}")
         xl.parent_id = _resolve_folder(xl, args.dir)
+        log(f"[XUNLEI] 目录 ID={xl.parent_id or 'root'}")
         size = os.path.getsize(args.file)
+        log(f"[XUNLEI] 计算 GCID: {args.name} ({size} bytes)")
         gcid = compute_gcid(args.file, size)
+        log("[XUNLEI] 创建上传任务…")
         file_id, params = xl.create_upload(args.name, size, gcid)
         if params:
+            log("[XUNLEI] S3 上传开始…")
             xl.put_s3(args.file, params)
+        else:
+            log("[XUNLEI] 秒传命中，跳过 S3 上传")
         log(f"[XUNLEI] 上传完成: {args.name} (file_id={file_id})")
 
     await asyncio.to_thread(work)
