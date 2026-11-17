@@ -62,7 +62,9 @@ class Xunlei:
         # 迅雷会轮换 refresh_token，轮换后通过该回调回写持久化存储
         self.on_refresh = None
         self.client_id = (os.getenv("XUNLEI_CLIENT_ID") or DEFAULT_CLIENT_ID).strip()
-        self.device_id = (os.getenv("XUNLEI_DEVICE_ID") or "").strip() or hashlib.md5(
+        env_device = (os.getenv("XUNLEI_DEVICE_ID") or "").strip()
+        self._device_from_env = bool(env_device)
+        self.device_id = env_device or hashlib.md5(
             f"{self.refresh_token}xlrefresh".encode()
         ).hexdigest()
         self.parent_id = (os.getenv("XUNLEI_PARENT_ID") or "").strip()
@@ -121,6 +123,11 @@ class Xunlei:
                     self.on_refresh(new_refresh)
                 except Exception as e:  # noqa: BLE001
                     log(f"[XUNLEI] 警告：轮换 token 回写失败: {e}")
+        # 设备号按账号派生，不能按 refresh_token 派生：token 每轮换一次设备号就会变，
+        # 迅雷会把每次运行当成新设备，captcha init 直接返回空对象。
+        user_id = info.get("sub") or info.get("user_id")
+        if user_id and not self._device_from_env:
+            self.device_id = hashlib.md5(f"{user_id}xlrefresh".encode()).hexdigest()
         self._access_token = token
         self._access_exp = time.time() + max(60, int(info.get("expires_in", 3600)) - 60)
         return token
@@ -129,32 +136,53 @@ class Xunlei:
         cached = self._captcha.get(action)
         if cached and cached[1] > time.time():
             return cached[0]
-        resp = self._request_retry(
-            "POST",
-            f"{AUTH_BASE}/v1/shield/captcha/init",
-            json={
-                "client_id": self.client_id,
-                "action": action,
-                "device_id": self.device_id,
-                "meta": {
-                    "username": "",
-                    "phone_number": "",
-                    "email": "",
-                    "package_name": "pan.xunlei.com",
-                    "client_version": "1.45.0",
-                    "captcha_sign": "1.fe2108ad808a74c9ac0243309242726c",
-                    "timestamp": "1645241033384",
-                    "user_id": "0",
-                },
+        payload = {
+            "client_id": self.client_id,
+            "action": action,
+            "device_id": self.device_id,
+            "meta": {
+                "username": "",
+                "phone_number": "",
+                "email": "",
+                "package_name": "pan.xunlei.com",
+                "client_version": "1.45.0",
+                "captcha_sign": "1.fe2108ad808a74c9ac0243309242726c",
+                "timestamp": "1645241033384",
+                "user_id": "0",
             },
-        )
-        data = resp.json() if resp.status_code < 400 else {}
-        info = data.get("data") or {}
-        token = info.get("captcha_token")
-        if not token:
-            raise XunleiError(f"领取 captcha_token 失败: {data.get('error') or data}")
-        self._captcha[action] = (token, time.time() + max(60, int(info.get("expires_in", 300)) - 10))
-        return token
+        }
+        headers = {
+            "User-Agent": UA,
+            "Origin": "https://pan.xunlei.com",
+            "Referer": "https://pan.xunlei.com/",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+        }
+        for attempt in range(1, 3):
+            try:
+                resp = self._request_retry(
+                    "POST",
+                    f"{AUTH_BASE}/v1/shield/captcha/init",
+                    json=payload,
+                    headers=headers,
+                )
+                data = resp.json() if resp.status_code < 400 else {}
+                info = data.get("data") or {}
+                token = info.get("captcha_token")
+                if token:
+                    self._captcha[action] = (
+                        token,
+                        time.time() + max(60, int(info.get("expires_in", 300)) - 10),
+                    )
+                    return token
+                log(f"[XUNLEI] captcha init 第 {attempt}/2 次返回空: {str(data)[:120]}")
+            except Exception as e:  # noqa: BLE001
+                log(f"[XUNLEI] captcha init 第 {attempt}/2 次异常: {e}")
+            if attempt < 2:
+                time.sleep(1)
+        # 文件列表 / 上传通常不强制 captcha，拿不到就空着继续
+        log("[XUNLEI] 未领取到 captcha_token，继续尝试（文件列表/上传通常不强制）")
+        return ""
 
     def request(
         self,
@@ -173,8 +201,10 @@ class Xunlei:
             "x-client-id": self.client_id,
             "x-device-id": self.device_id,
             "Authorization": f"Bearer {self.access_token()}",
-            "x-captcha-token": self.captcha_token(action),
         }
+        captcha = self.captcha_token(action)
+        if captcha:
+            headers["x-captcha-token"] = captcha
         resp = self._request_retry(
             method, f"{API_BASE}{path}", params=params, json=body, headers=headers
         )
