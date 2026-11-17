@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--file", required=True, help="本地待上传文件")
     p.add_argument("--name", required=True, help="网盘内文件名")
     p.add_argument("--dir", required=True, help="网盘目标目录，如 /images/Docker Hub/nginx")
+    p.add_argument("--version", default="", help="镜像版本/tag，用于 latest 等移动标签的覆盖处理")
     p.add_argument("--output", required=True, help="结果 JSON 输出路径")
     p.add_argument("--callback-url", default="", help="Worker 回调地址")
     p.add_argument("--callback-secret", default="")
