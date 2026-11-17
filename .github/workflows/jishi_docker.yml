@@ -506,7 +506,7 @@ jobs:
           fi
 
           python3 -m venv /tmp/pan-venv
-          /tmp/pan-venv/bin/pip install --quiet --disable-pip-version-check httpx oss2 boto3 aligo
+          /tmp/pan-venv/bin/pip install --quiet --disable-pip-version-check httpx oss2 boto3 aligo quarkpan==1.0.5
 
           # 从当前正在运行的 workflow 文件解出内嵌脚本（文件名可能是 jishi_docker.yml 等）
           mkdir -p /tmp/jishi-pans
@@ -564,7 +564,6 @@ jobs:
             --callback-secret "$CALLBACK_SECRET" \
             --task-id "$TASK_ID" \
             --timeout 1800
-          echo "results=$(cat /tmp/pan-results.json)" >> "$GITHUB_OUTPUT"
 
       # ============================================================
       # 步骤 8：回传每文件每网盘归档结果
@@ -689,6 +688,7 @@ jobs:
 # import hashlib
 # import json
 # import os
+# import shutil
 # import sys
 # import time
 # from pathlib import Path
@@ -792,48 +792,11 @@ jobs:
 #     return parent
 #
 #
-# def _quark_put_oss(path: str, auth: dict, bucket: str, object_key: str) -> None:
-#     try:
-#         import oss2
-#     except ImportError as e:
-#         raise PanError("缺少 oss2，请 pip install oss2") from e
-#
-#     ak = auth.get("access_key_id") or auth.get("AccessKeyId")
-#     sk = auth.get("access_key_secret") or auth.get("AccessKeySecret")
-#     token = auth.get("security_token") or auth.get("SecurityToken")
-#     endpoint = auth.get("endpoint") or auth.get("EndPoint") or ""
-#     bucket_name = auth.get("bucket") or bucket
-#     if not (ak and sk and endpoint):
-#         raise PanError("夸克上传凭证不完整（auth_info）")
-#     if not endpoint.startswith("http"):
-#         endpoint = "https://" + endpoint
-#     # endpoint 有时带 bucket 前缀，oss2 需要 bucket 无关的 endpoint
-#     prefix = f"https://{bucket_name}."
-#     if endpoint.startswith(prefix):
-#         endpoint = "https://" + endpoint[len(prefix):]
-#     prefix_http = f"http://{bucket_name}."
-#     if endpoint.startswith(prefix_http):
-#         endpoint = "http://" + endpoint[len(prefix_http):]
-#
-#     auth_obj = oss2.StsAuth(ak, sk, token) if token else oss2.Auth(ak, sk)
-#     b = oss2.Bucket(auth_obj, endpoint, bucket_name)
-#     # 大文件走分片上传，避免单次 PUT 的 5GB 限制
-#     oss2.resumable_upload(
-#         b,
-#         object_key,
-#         path,
-#         multipart_threshold=64 * 1024 * 1024,
-#         part_size=16 * 1024 * 1024,
-#         num_threads=4,
-#     )
-#
-#
 # async def upload_quark(path: str, name: str, folder: str) -> dict:
 #     cookie = (os.getenv("QUARK_COOKIE") or "").strip()
 #     if not cookie:
 #         return {"provider": "quark", "status": "skipped", "error": "未配置 QUARK_COOKIE"}
 #
-#     size = os.path.getsize(path)
 #     headers = {
 #         "Cookie": cookie,
 #         "User-Agent": DEFAULT_UA,
@@ -842,71 +805,48 @@ jobs:
 #         "Accept": "application/json, text/plain, */*",
 #         "Content-Type": "application/json",
 #     }
+#     # 目录仍由本脚本创建（兼容 /images/{registry}/{image} 多级目录）
 #     async with httpx.AsyncClient(timeout=3600, headers=headers, follow_redirects=True) as client:
 #         pdir_fid = await _quark_ensure_folder(client, folder)
-#         pre = await _quark_request(
-#             client,
-#             "POST",
-#             "file/upload/pre",
-#             _quark_params(),
-#             {
-#                 "file_name": name,
-#                 "size": size,
-#                 "pdir_fid": pdir_fid,
-#                 "format_type": "application/octet-stream",
-#                 "checksum": "",
-#                 "dir": False,
-#             },
-#         )
-#         d = pre.get("data") or {}
-#         if d.get("finish") or d.get("return_type") == 2:
-#             log(f"[QUARK] 秒传命中: {name}")
-#             return {"provider": "quark", "status": "success", "error": None}
 #
-#         upload_id = d.get("upload_id")
-#         bucket = d.get("bucket")
-#         object_key = d.get("object_key")
-#         auth = d.get("auth_info")
-#         if isinstance(auth, str):
-#             try:
-#                 auth = json.loads(auth)
-#             except json.JSONDecodeError:
-#                 auth = {}
-#         if not (upload_id and bucket and object_key and auth):
-#             raise PanError(f"夸克预上传未返回完整参数: {json.dumps(d)[:300]}")
-#
-#         log(f"[QUARK] 直传 OSS: {name} ({size} bytes)")
-#         await asyncio.to_thread(_quark_put_oss, path, auth, bucket, object_key)
-#
-#         complete_body = {
-#             "upload_id": upload_id,
-#             "file_name": name,
-#             "pdir_fid": pdir_fid,
-#             "format_type": "application/octet-stream",
-#             "size": size,
-#             "dir": False,
-#         }
+#     # 上传交给 quarkpan：夸克已改为 task_id + file/update/hash + OSS 分片签名，
+#     # 旧版 upload/pre + checksum 流程会报 "md5 is null"。
+#     def _do_upload() -> None:
 #         try:
-#             await _quark_request(
-#                 client, "POST", "file/upload/complete", _quark_params(), complete_body
-#             )
-#         except PanError:
-#             # 部分账号需要先确认 auth 再 complete
+#             from quark_client import QuarkClient
+#         except ImportError as e:
+#             raise PanError("缺少 quarkpan，请 pip install quarkpan==1.0.5") from e
+#
+#         # quarkpan 用本地文件名作为网盘文件名，先硬链接成目标文件名
+#         staging = "/tmp/jishi-pans/quark-upload"
+#         os.makedirs(staging, exist_ok=True)
+#         local = os.path.join(staging, name)
+#         if os.path.exists(local):
+#             os.remove(local)
+#         try:
+#             os.link(path, local)
+#         except OSError:
+#             shutil.copy2(path, local)
+#
+#         qc = QuarkClient(cookies=cookie, auto_login=False)
+#         try:
+#             result = qc.upload.upload_file(local, parent_folder_id=pdir_fid)
+#         finally:
 #             try:
-#                 await _quark_request(
-#                     client,
-#                     "POST",
-#                     "file/upload/auth",
-#                     _quark_params(),
-#                     {"upload_id": upload_id, "auth_info": auth},
-#                 )
-#             except PanError:
+#                 qc.api_client.close()
+#             except Exception:
 #                 pass
-#             await _quark_request(
-#                 client, "POST", "file/upload/complete", _quark_params(), complete_body
-#             )
-#         log(f"[QUARK] 上传完成: {name}")
-#         return {"provider": "quark", "status": "success", "error": None}
+#             try:
+#                 os.remove(local)
+#             except OSError:
+#                 pass
+#         if (result or {}).get("status") != "success":
+#             raise PanError(f"夸克上传未完成: {str(result)[:300]}")
+#
+#     log(f"[QUARK] 上传: {name} -> {folder}")
+#     await asyncio.to_thread(_do_upload)
+#     log(f"[QUARK] 上传完成: {name}")
+#     return {"provider": "quark", "status": "success", "error": None}
 #
 #
 # # =============================================================
@@ -1048,7 +988,12 @@ jobs:
 #
 #         from aligo import Aligo
 #
-#         ali = Aligo(refresh_token=token, re_login=False, level=logging.WARNING)
+#         try:
+#             ali = Aligo(refresh_token=token, re_login=False, level=logging.WARNING)
+#         except Exception as e:
+#             raise PanError(
+#                 f"阿里云盘 refresh_token 无效（当前长度 {len(token)}，应只填 refresh_token 字段值）: {e}"
+#             ) from e
 #         # 逐级创建 /images/{registry}/{image}
 #         parent = "root"
 #         target = None
