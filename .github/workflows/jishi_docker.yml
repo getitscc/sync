@@ -8,6 +8,7 @@ name: Docker Sync
 # 需要 Secrets：
 #   R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
 #   R2_BUCKET（可选，默认 jishi）
+#   对象键：<R2_PREFIX>/<registry>/<文件>，与网盘 /jishi_repo/<R2_PREFIX>/<registry>/<文件> 一致。
 #   R2_PREFIX（可选，默认 docker）
 #   CALLBACK_SECRET       与 Worker 的 WEBHOOK_SECRET 一致
 # =====================================================
@@ -156,6 +157,7 @@ jobs:
             echo "ARCH_NAME=$ARCH_NAME"
             echo "ARCH_VARIANT=$ARCH_VARIANT"
             echo "CATEGORY_DIR=$CATEGORY_DIR"
+            echo "REGISTRY=$REGISTRY"
             echo "REGISTRY_LABEL=$REGISTRY_LABEL"
             echo "IMAGE_DIR=$IMAGE_DIR"
             echo "TAR_NAME=$TAR_NAME"
@@ -351,7 +353,8 @@ jobs:
           BUCKET="${R2_BUCKET:-jishi}"
           PREFIX="${R2_PREFIX:-docker}"
           PREFIX="${PREFIX%/}"
-          R2_KEY="${PREFIX}/${PAN_FILE_NAME}"
+          # 与网盘路径保持一致：<PREFIX>/<registry>/<file>
+          R2_KEY="${PREFIX}/${REGISTRY}/${PAN_FILE_NAME}"
           echo "R2_KEY=$R2_KEY" >> "$GITHUB_ENV"
 
           export RCLONE_CONFIG_R2_TYPE=s3
