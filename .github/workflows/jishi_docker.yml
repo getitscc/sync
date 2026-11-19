@@ -8,8 +8,9 @@ name: Docker Sync
 # 需要 Secrets：
 #   R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
 #   R2_BUCKET（可选，默认 jishi）
-#   对象键：<R2_PREFIX>/<registry>/<文件>，与网盘 /jishi_repo/<R2_PREFIX>/<registry>/<文件> 一致。
-#   R2_PREFIX（可选，默认 docker）
+#   对象键：<registry别名>/<镜像名>/<文件>。
+#   网盘路径：<挂载>/images/<registry别名>/<镜像名>/<文件>（顶层统一 images）。
+#   例：R2 键 docker/redis/redis_6_linux-amd64.tar.gz → 网盘 /images/docker/redis/redis_6_linux-amd64.tar.gz
 #   CALLBACK_SECRET       与 Worker 的 WEBHOOK_SECRET 一致
 # =====================================================
 
@@ -111,17 +112,17 @@ jobs:
             if [[ "$FIRST" == *.* ]]; then REGISTRY="$FIRST"; REPO_PATH="${FULL_REPO#*/}"; fi
           fi
           case "$REGISTRY" in
-            docker.io)                REGISTRY_LABEL="Docker Hub" ;;
-            ghcr.io)                  REGISTRY_LABEL="GHCR" ;;
-            registry.k8s.io)          REGISTRY_LABEL="K8s" ;;
-            nvcr.io)                  REGISTRY_LABEL="NVIDIA" ;;
-            gcr.io)                   REGISTRY_LABEL="Google" ;;
-            quay.io)                  REGISTRY_LABEL="Quay" ;;
-            mcr.microsoft.com)         REGISTRY_LABEL="Microsoft" ;;
-            docker.elastic.co)        REGISTRY_LABEL="Elastic" ;;
-            docker.n8n.io)            REGISTRY_LABEL="n8n" ;;
-            skywalking.docker.scarf.sh) REGISTRY_LABEL="SkyWalking" ;;
-            *)                        REGISTRY_LABEL="$REGISTRY" ;;
+            docker.io)                REGISTRY_ALIAS="docker";     REGISTRY_LABEL="Docker Hub" ;;
+            ghcr.io)                  REGISTRY_ALIAS="ghcr";       REGISTRY_LABEL="GHCR" ;;
+            registry.k8s.io)          REGISTRY_ALIAS="k8s";        REGISTRY_LABEL="K8s" ;;
+            nvcr.io)                  REGISTRY_ALIAS="nvidia";     REGISTRY_LABEL="NVIDIA" ;;
+            gcr.io)                   REGISTRY_ALIAS="google";     REGISTRY_LABEL="Google" ;;
+            quay.io)                  REGISTRY_ALIAS="quay";       REGISTRY_LABEL="Quay" ;;
+            mcr.microsoft.com)         REGISTRY_ALIAS="microsoft";  REGISTRY_LABEL="Microsoft" ;;
+            docker.elastic.co)        REGISTRY_ALIAS="elastic";    REGISTRY_LABEL="Elastic" ;;
+            docker.n8n.io)            REGISTRY_ALIAS="n8n";        REGISTRY_LABEL="n8n" ;;
+            skywalking.docker.scarf.sh) REGISTRY_ALIAS="skywalking"; REGISTRY_LABEL="SkyWalking" ;;
+            *)                        REGISTRY_ALIAS="${REGISTRY//./-}"; REGISTRY_LABEL="$REGISTRY" ;;
           esac
           if [[ "$REGISTRY" == "docker.io" && "$REPO_PATH" == library/* ]]; then
             IMAGE_DIR="${REPO_PATH#library/}"
@@ -158,6 +159,7 @@ jobs:
             echo "ARCH_VARIANT=$ARCH_VARIANT"
             echo "CATEGORY_DIR=$CATEGORY_DIR"
             echo "REGISTRY=$REGISTRY"
+            echo "REGISTRY_ALIAS=$REGISTRY_ALIAS"
             echo "REGISTRY_LABEL=$REGISTRY_LABEL"
             echo "IMAGE_DIR=$IMAGE_DIR"
             echo "TAR_NAME=$TAR_NAME"
@@ -205,8 +207,18 @@ jobs:
           if [[ "$FULL_IMAGE" == nvcr.io/* ]] && [ -n "${NGC_API_KEY:-}" ]; then
             echo "$NGC_API_KEY" | skopeo login nvcr.io -u '$oauthtoken' --password-stdin
           fi
-          if [[ "$FULL_IMAGE" == docker.io/* ]] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
-            echo "$DOCKERHUB_TOKEN" | skopeo login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
+          # docker.n8n.io / skywalking.docker.scarf.sh 复用 Docker Hub 鉴权，
+          # 不登录会按匿名用户计入 Docker Hub 拉取限额。
+          if [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            DOCKERHUB_HOST=""
+            case "$FULL_IMAGE" in
+              docker.io/*) DOCKERHUB_HOST="docker.io" ;;
+              docker.n8n.io/*) DOCKERHUB_HOST="docker.n8n.io" ;;
+              skywalking.docker.scarf.sh/*) DOCKERHUB_HOST="skywalking.docker.scarf.sh" ;;
+            esac
+            if [ -n "$DOCKERHUB_HOST" ]; then
+              echo "$DOCKERHUB_TOKEN" | skopeo login "$DOCKERHUB_HOST" -u "$DOCKERHUB_USERNAME" --password-stdin
+            fi
           fi
 
           PLATFORM=(--override-os "$ARCH_OS" --override-arch "$ARCH_NAME")
@@ -343,7 +355,6 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          R2_PREFIX: ${{ secrets.R2_PREFIX }}
         run: |
           set -euo pipefail
           [ -n "${R2_ACCOUNT_ID:-}" ] || { echo "::error::缺少 secret R2_ACCOUNT_ID"; exit 1; }
@@ -351,10 +362,8 @@ jobs:
           [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || { echo "::error::缺少 secret R2_SECRET_ACCESS_KEY"; exit 1; }
 
           BUCKET="${R2_BUCKET:-jishi}"
-          PREFIX="${R2_PREFIX:-docker}"
-          PREFIX="${PREFIX%/}"
-          # 与网盘路径保持一致：<PREFIX>/<registry>/<file>
-          R2_KEY="${PREFIX}/${REGISTRY}/${PAN_FILE_NAME}"
+          # R2 对象键：<registry别名>/<镜像名>/<文件>（网盘侧由 Agent 加 images/ 前缀）
+          R2_KEY="${REGISTRY_ALIAS}/${IMAGE_DIR}/${PAN_FILE_NAME}"
           echo "R2_KEY=$R2_KEY" >> "$GITHUB_ENV"
 
           export RCLONE_CONFIG_R2_TYPE=s3
