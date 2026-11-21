@@ -7,7 +7,7 @@ name: Docker Sync
 #
 # 需要 Secrets：
 #   R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
-#   R2_BUCKET（可选，默认 jishi）
+#   R2_BUCKET（可选，默认 docker）
 #   对象键：<registry别名>/<镜像名>/<文件>。
 #   网盘路径：<挂载>/images/<registry别名>/<镜像名>/<文件>（顶层统一 images）。
 #   例：R2 键 docker/redis/redis_6_linux-amd64.tar.gz → 网盘 /images/docker/redis/redis_6_linux-amd64.tar.gz
@@ -16,7 +16,7 @@ name: Docker Sync
 
 on:
   repository_dispatch:
-    types: [jishi_docker]
+    types: [shiji_docker]
   workflow_dispatch:
     inputs:
       source_name:
@@ -361,7 +361,7 @@ jobs:
           [ -n "${R2_ACCESS_KEY_ID:-}" ] || { echo "::error::缺少 secret R2_ACCESS_KEY_ID"; exit 1; }
           [ -n "${R2_SECRET_ACCESS_KEY:-}" ] || { echo "::error::缺少 secret R2_SECRET_ACCESS_KEY"; exit 1; }
 
-          BUCKET="${R2_BUCKET:-jishi}"
+          BUCKET="${R2_BUCKET:-docker}"
           # R2 对象键：<registry别名>/<镜像名>/<文件>（网盘侧由 Agent 加 images/ 前缀）
           R2_KEY="${REGISTRY_ALIAS}/${IMAGE_DIR}/${PAN_FILE_NAME}"
           echo "R2_KEY=$R2_KEY" >> "$GITHUB_ENV"
@@ -469,7 +469,7 @@ jobs:
             export RCLONE_CONFIG_R2_REGION=auto
             export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
             export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
-            rclone deletefile "r2:${R2_BUCKET:-jishi}/${R2_KEY}" 2>/dev/null || true
+            rclone deletefile "r2:${R2_BUCKET:-docker}/${R2_KEY}" 2>/dev/null || true
           fi
 
           [ -n "${CALLBACK_URL:-}" ] || exit 0
