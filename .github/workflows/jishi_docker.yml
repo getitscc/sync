@@ -277,7 +277,36 @@ jobs:
 
           LOCAL_TAR="${WORK_DIR}/${TAR_NAME}"
           LOCAL_FILE="${LOCAL_TAR}.gz"
-          skopeo copy --tmpdir "$TMPDIR" "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
+
+          copy_to_tar() {
+            skopeo copy --tmpdir "$TMPDIR" "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
+          }
+
+          # 少数镜像的 OCI 清单里混用了 Docker 层 mediaType（application/vnd.docker.image.rootfs.diff.tar.gzip），
+          # skopeo 转 docker-archive 时无法识别该组合，报
+          # "Unknown media type during manifest conversion"，此时落盘 dir 布局、把清单归一化为 Docker schema2 再打包。
+          if ! copy_to_tar; then
+            echo "::warning::直接转 docker-archive 失败，改用 dir 布局归一化清单 mediaType 后重试"
+            rm -f "$LOCAL_TAR"
+            LAYOUT_DIR="${WORK_DIR}/dir_layout"
+            rm -rf "$LAYOUT_DIR"
+            skopeo copy --tmpdir "$TMPDIR" "${PLATFORM[@]}" "docker://${FULL_IMAGE}" "dir:${LAYOUT_DIR}"
+            if jq -e '.layers' "${LAYOUT_DIR}/manifest.json" >/dev/null 2>&1; then
+              jq '
+                .mediaType = "application/vnd.docker.distribution.manifest.v2+json"
+                | .config.mediaType = "application/vnd.docker.container.image.v1+json"
+                | .layers |= map(.mediaType |= (
+                    if . == "application/vnd.oci.image.layer.v1.tar+gzip" then "application/vnd.docker.image.rootfs.diff.tar.gzip"
+                    elif . == "application/vnd.oci.image.layer.v1.tar" then "application/vnd.docker.image.rootfs.diff.tar"
+                    elif . == "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip" then "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip"
+                    elif . == "application/vnd.oci.image.layer.nondistributable.v1.tar" then "application/vnd.docker.image.rootfs.foreign.diff.tar"
+                    else . end))
+              ' "${LAYOUT_DIR}/manifest.json" > "${LAYOUT_DIR}/manifest.json.tmp"
+              mv "${LAYOUT_DIR}/manifest.json.tmp" "${LAYOUT_DIR}/manifest.json"
+            fi
+            skopeo copy --tmpdir "$TMPDIR" "dir:${LAYOUT_DIR}" "docker-archive:${LOCAL_TAR}:${FULL_IMAGE}"
+            rm -rf "$LAYOUT_DIR"
+          fi
           rm -rf "${TMPDIR:?}"/*
 
           if [ -n "$CALLBACK_URL" ]; then
